@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use nats::asynk::Connection as NatsConnection;
+use async_nats::Client as NatsClient;
 use serde::Serialize;
 use sqlx::{mysql::MySqlPoolOptions, MySql, MySqlPool, QueryBuilder};
 use thiserror::Error;
@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct DurableEventStore {
-    nats: NatsConnection,
+    nats: NatsClient,
     tidb: MySqlPool,
     enqueue_tx: mpsc::Sender<PendingEvent>,
 }
@@ -38,8 +38,11 @@ pub enum DurableEventStoreError {
     #[error("failed to serialize event payload")]
     Serialize(#[from] serde_json::Error),
 
+    #[error("nats connect failed")]
+    NatsConnect(#[from] async_nats::ConnectError),
+
     #[error("nats publish failed")]
-    Nats(#[from] std::io::Error),
+    NatsPublish(#[from] async_nats::PublishError),
 
     #[error("tidb write failed")]
     Sqlx(#[from] sqlx::Error),
@@ -68,7 +71,7 @@ impl DurableEventStore {
     ///
     /// TiDB table expectation (one possible schema):
     /// - `agent_events(agent_id VARCHAR(..), event_id VARCHAR(..), payload_json JSON, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
-    pub fn new(nats: NatsConnection, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
+    pub fn new(nats: NatsClient, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
         let (enqueue_tx, enqueue_rx) = mpsc::channel(cfg.channel_capacity);
         tokio::spawn(run_tidb_batch_writer(tidb.clone(), cfg, enqueue_rx));
 
@@ -85,7 +88,7 @@ impl DurableEventStore {
         tidb_url: &str,
         cfg: DurableEventStoreConfig,
     ) -> Result<Self, DurableEventStoreError> {
-        let nats = nats::asynk::connect(nats_url).await?;
+        let nats = async_nats::connect(nats_url).await?;
         let tidb = MySqlPoolOptions::new().connect(tidb_url).await?;
         Ok(Self::new(nats, tidb, cfg))
     }
@@ -107,7 +110,9 @@ impl DurableEventStore {
         };
         let payload_json = serde_json::to_vec(&envelope)?;
 
-        self.nats.publish(&subject, payload_json.clone()).await?;
+        self.nats
+            .publish(subject, payload_json.clone().into())
+            .await?;
 
         let pending = PendingEvent {
             agent_id: agent_id.to_string(),

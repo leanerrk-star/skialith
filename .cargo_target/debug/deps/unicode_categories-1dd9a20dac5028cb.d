@@ -1,0 +1,8 @@
+/Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_target/debug/deps/unicode_categories-1dd9a20dac5028cb.d: /Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/lib.rs /Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/tables.rs
+
+/Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_target/debug/deps/libunicode_categories-1dd9a20dac5028cb.rlib: /Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/lib.rs /Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/tables.rs
+
+/Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_target/debug/deps/libunicode_categories-1dd9a20dac5028cb.rmeta: /Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/lib.rs /Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/tables.rs
+
+/Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/lib.rs:
+/Users/ramakrishnapatwari/Projects/Durable/durable_agent_core/.cargo_home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode_categories-0.1.1/src/tables.rs:
