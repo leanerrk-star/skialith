@@ -1,0 +1,12 @@
+[package]
+name = "nuid"
+version = "0.3.2"
+edition = "2018"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/rs-nuid.git"
+description = "A highly performant unique identifier generator."
+
+[dependencies]
+lazy_static = "1.2"
+rand = "0.8"
+

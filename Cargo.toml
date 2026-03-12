@@ -1,0 +1,18 @@
+[package]
+name = "durable_agent_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nats = "0.25.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql"] }
+thiserror = "2.0.16"
+tokio = { version = "1.50.0", features = ["full"] }
+
+[patch.crates-io]
+# `nats` depends on `nuid` 0.3.x which declares `rand = ">=0.8"`; that can
+# resolve to newer `rand` releases that removed older APIs used by `nuid` 0.3.x.
+# We vendor a minimal patch to pin `rand` to 0.8 for compatibility.
+nuid = { path = "vendor/nuid" }
