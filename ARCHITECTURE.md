@@ -69,7 +69,8 @@ CREATE TABLE agent_traces (
     event_type ENUM('thought', 'tool_call', 'observation') NOT NULL,
     payload JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_agent_step (agent_id, step_index)
+    INDEX idx_agent_step (agent_id, step_index),
+    UNIQUE KEY uq_agent_step (agent_id, step_index)
 );
 ```
 
@@ -95,6 +96,16 @@ Why:
 
 - Centralizes how trace rows are written so both ingestion and any future writers stay schema-aligned.
 - Encodes the event type in a first-class enum instead of stringly-typed literals.
+### Idempotency in `agent_traces`
+
+- We add a **UNIQUE constraint** on `(agent_id, step_index)` to enforce at-most-one logical trace per agent step.
+- `AgentTrace::insert` treats duplicate-key violations (SQLSTATE `23000` with a “Duplicate” message) as **success**:
+  - If a concurrent writer has already inserted the same `(agent_id, step_index)` row, the second writer becomes a no-op instead of an error.
+
+Why:
+
+- Provides an idempotent write path from the WAL ingestion layer to TiDB.
+- Allows safe retries (or duplicate deliveries from JetStream) without corrupting or duplicating logical steps.
 
 ### JetStream trace ingestion (`trace_ingest`)
 
