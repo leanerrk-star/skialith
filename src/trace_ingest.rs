@@ -1,8 +1,10 @@
 use async_nats::jetstream;
 use futures::StreamExt;
 use serde_json::Value;
-use sqlx::{types::Json, MySqlPool};
+use sqlx::MySqlPool;
 use thiserror::Error;
+
+use crate::agent_trace::{AgentEventType, AgentTrace};
 
 #[derive(Debug, Error)]
 pub enum TraceIngestError {
@@ -75,18 +77,30 @@ pub async fn ingest_agent_trace_stream(
 
             let payload: Value = serde_json::from_slice(&msg.payload)?;
 
-            // Uses the provided pool (sqlx will multiplex connections).
-            sqlx::query(
-                r#"
-                INSERT INTO agent_traces (agent_id, subject, payload_json)
-                VALUES (?, ?, ?)
-                "#,
-            )
-            .bind(agent_id)
-            .bind(subject)
-            .bind(Json(payload))
-            .execute(&tidb_pool)
-            .await?;
+            // Derive step_index and event_type from the payload if present, otherwise fall back.
+            let step_index = payload
+                .get("step_index")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+
+            let event_type = payload
+                .get("event_type")
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "tool_call" => AgentEventType::ToolCall,
+                    "observation" => AgentEventType::Observation,
+                    _ => AgentEventType::Thought,
+                })
+                .unwrap_or(AgentEventType::Thought);
+
+            let trace = AgentTrace {
+                agent_id,
+                step_index,
+                event_type,
+                payload,
+            };
+
+            trace.insert(&tidb_pool).await?;
 
             msg.ack().await.map_err(TraceIngestError::Nats)?;
         }

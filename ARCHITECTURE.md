@@ -41,9 +41,11 @@ Why this design:
 - **TiDB batched writes**: batching reduces per-event overhead (round trips, transaction costs) and improves throughput.
 - **Async boundary via channel**: `tokio::mpsc` provides backpressure and isolates the caller from the DB’s performance profile.
 
-### TiDB table: `agent_events`
+### TiDB tables
 
-The event store expects a table named `agent_events` with at least:
+#### `agent_events` (DurableEventStore)
+
+`DurableEventStore` currently targets a generic `agent_events` table for its batched inserts:
 
 - `agent_id` (string)
 - `event_id` (string)
@@ -52,8 +54,124 @@ The event store expects a table named `agent_events` with at least:
 
 Notes:
 
-- The current implementation binds JSON as a string. TiDB’s JSON type accepts JSON text.
+- The implementation binds JSON as UTF‑8 text; TiDB’s `JSON` type happily accepts this.
 - For production use, consider indexes like `(agent_id, created_at)` and/or a unique constraint on `(agent_id, event_id)` if you want idempotent inserts.
+
+#### `agent_traces` (canonical trace/event log)
+
+The system-of-record schema for traces is:
+
+```sql
+CREATE TABLE agent_traces (
+    id BIGINT PRIMARY KEY AUTO_RANDOM,
+    agent_id VARCHAR(255) NOT NULL,
+    step_index INT NOT NULL,
+    event_type ENUM('thought', 'tool_call', 'observation') NOT NULL,
+    payload JSON,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_agent_step (agent_id, step_index)
+);
+```
+
+This table is populated by the JetStream ingester (see below) using the strongly-typed `AgentTrace` struct.
+
+### `AgentTrace` and event typing
+
+Source: `src/agent_trace.rs`
+
+- **`AgentEventType`**: Rust enum mirroring the TiDB `event_type` ENUM (`thought`, `tool_call`, `observation`).
+- **`AgentTrace`**: in-memory representation of a row in `agent_traces`:
+  - `agent_id: String`
+  - `step_index: i32`
+  - `event_type: AgentEventType`
+  - `payload: serde_json::Value`
+- **`AgentTrace::insert`**: helper that performs:
+
+  ```sql
+  INSERT INTO agent_traces (agent_id, step_index, event_type, payload) VALUES (?, ?, ?, ?)
+  ```
+
+Why:
+
+- Centralizes how trace rows are written so both ingestion and any future writers stay schema-aligned.
+- Encodes the event type in a first-class enum instead of stringly-typed literals.
+
+### JetStream trace ingestion (`trace_ingest`)
+
+Source: `src/trace_ingest.rs`
+
+Responsibilities:
+
+- Consume messages from JetStream for subject pattern `agent.trace.*`.
+- Decode the JSON payload with `serde_json`.
+- Derive `step_index` and `event_type` from the payload (with sensible defaults).
+- Persist into TiDB’s `agent_traces` using `AgentTrace::insert`.
+- ACK JetStream messages **only after** a successful DB write (at-least-once semantics).
+
+Behavior:
+
+- Subject parsing:
+  - Extracts `agent_id` from `agent.trace.{agent_id}`.
+- Payload expectations:
+  - If `step_index` exists as an integer, it is used; otherwise defaults to `0`.
+  - If `event_type` is `"tool_call"` or `"observation"`, those variants are used; anything else defaults to `"thought"`.
+- Backpressure:
+  - Uses a pull consumer (`fetch().max_messages(...).expires(...)`) and processes messages in bounded batches.
+
+Why this design:
+
+- Gives you a clean, typed bridge from JetStream to TiDB aligned with the `agent_traces` schema.
+- Decouples NATS subject shape and JSON envelope details from the database layout.
+
+### Agent checkpointing (`AgentManager`)
+
+Source: `src/agent_manager.rs`
+
+Responsibilities:
+
+- Provide a simple API for agents to **checkpoint state before calling an LLM or tools**.
+- Ensure the **WAL is updated first** by publishing into JetStream and awaiting the PubAck.
+
+Key behavior:
+
+- `checkpoint_state(agent_id, state)`:
+  - Serializes the arbitrary JSON-compatible `state`.
+  - Publishes to JetStream subject `agent.checkpoint.{agent_id}`.
+  - Attaches headers:
+    - `X-Priority: high`
+    - `X-WAL-Phase: checkpoint`
+    - `X-Agent-Id: {agent_id}`
+  - Awaits the JetStream PubAck future and only then returns to the caller.
+
+Why:
+
+- Encodes the “WAL before work” rule: no tool execution should happen until this high-priority checkpoint has been durably appended.
+- Uses headers to carry priority/phase information in a way that downstream executors and observability tooling can inspect.
+
+### Resurrection logic (`resurrection`)
+
+Source: `src/resurrection.rs`
+
+Responsibilities:
+
+- Provide **“resurrection”** semantics when a worker crashes: recover the last known state for an agent from TiDB and resume.
+
+Key behavior:
+
+- `resume_agent(agent_id)`:
+  - Queries `agent_traces` for the latest `step_index` for that `agent_id` **where `event_type = 'thought'`**.
+  - Interprets the `payload` JSON for that row as the authoritative checkpointed state.
+  - If a row exists:
+    - Returns `AgentState { agent_id, step_index, state: payload }`.
+  - If no row exists:
+    - Returns a default `New Agent` state:
+      - `step_index = 0`
+      - `state = { "kind": "NewAgent", "step_index": 0 }`.
+
+Why:
+
+- Treats `thought` events as durable checkpoints of the agent’s cognitive state between tool invocations.
+- Aligns with the indexed `(agent_id, step_index)` pattern for efficient “latest state” lookups.
 
 ## Configuration
 
@@ -123,7 +241,7 @@ Why:
 
 Common next steps for hardening:
 
-- Add a migration for `agent_events` (and indexes/uniques based on query patterns).
+- Add migrations for both `agent_events` (if kept) and `agent_traces` that match how the code reads/writes.
 - Add retry/backoff and/or a dead-letter path for failed TiDB writes.
 - Consider publishing with JetStream acks and stream configuration verification for durability guarantees.
 - Add tracing/metrics around queue depth, batch flush latency, and DB error rates.
