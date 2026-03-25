@@ -143,11 +143,16 @@ async fn bench_batch_sizes(
             .expect("connect failed");
 
         // Publish all events as fast as possible.
+        // Use a uuid-style suffix to avoid collisions across benchmark re-runs.
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         for i in 0..event_count {
             store
                 .save_event(
                     "bench-agent-batch",
-                    &format!("evt-batch{batch_size}-{i}"),
+                    &format!("evt-{run_id}-{i}"),
                     &serde_json::json!({ "step": i }),
                 )
                 .await
