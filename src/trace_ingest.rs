@@ -3,6 +3,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use sqlx::MySqlPool;
 use thiserror::Error;
+use tracing::debug;
 
 use crate::agent_trace::{AgentEventType, AgentTrace};
 
@@ -68,6 +69,7 @@ pub async fn ingest_agent_trace_stream(
         while let Some(msg) = batch.next().await {
             let msg = msg.map_err(TraceIngestError::Nats)?;
             let subject = msg.subject.as_str().to_string();
+            let _span = tracing::info_span!("process_message", subject = %subject).entered();
             let agent_id = subject
                 .split('.')
                 .nth(2) // agent.trace.{agent_id}
@@ -107,6 +109,7 @@ pub async fn ingest_agent_trace_stream(
             };
 
             trace.insert(&tidb_pool).await?;
+            debug!(agent_id = %trace.agent_id, step_index = trace.step_index, "trace inserted");
 
             msg.ack().await.map_err(TraceIngestError::Nats)?;
         }

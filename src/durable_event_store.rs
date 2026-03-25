@@ -6,6 +6,7 @@ use sqlx::{mysql::MySqlPoolOptions, MySql, MySqlPool, QueryBuilder};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_retry::strategy::ExponentialBackoff;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct DurableEventStore {
@@ -138,6 +139,7 @@ impl DurableEventStore {
         self.nats
             .publish(subject, payload_json.clone().into())
             .await?;
+        debug!(agent_id, event_id, "event published to NATS");
 
         let pending = PendingEvent {
             agent_id: agent_id.to_string(),
@@ -228,6 +230,7 @@ async fn run_tidb_batch_writer(
                 match maybe_ev {
                     Some(ev) => {
                         batch.push(ev);
+                        debug!(queue_depth = batch.len(), "event enqueued");
                         if batch.len() >= cfg.max_batch_size {
                             flush_batch_with_retry(&tidb, &mut batch, &dead_letter_tx).await;
                         }
@@ -251,6 +254,7 @@ async fn run_tidb_batch_writer(
 }
 
 async fn flush_batch(tidb: &MySqlPool, batch: &mut Vec<PendingEvent>) -> Result<(), sqlx::Error> {
+    debug!(batch_size = batch.len(), "flushing batch to TiDB");
     let mut tx = tidb.begin().await?;
 
     // Multi-row insert; TiDB supports this efficiently.
@@ -269,6 +273,7 @@ async fn flush_batch(tidb: &MySqlPool, batch: &mut Vec<PendingEvent>) -> Result<
 
     qb.build().execute(&mut *tx).await?;
     tx.commit().await?;
+    info!(batch_size = batch.len(), "batch committed to TiDB");
 
     batch.clear();
     Ok(())

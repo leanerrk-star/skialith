@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{types::Json, MySqlPool};
 use thiserror::Error;
+use tracing::{info, warn};
 
 #[derive(Debug, Error)]
 pub enum ResurrectionError {
@@ -77,13 +78,17 @@ pub async fn resume_agent(
                 .map(|j| j.0)
                 .unwrap_or_else(|| json!({"kind": "Unknown", "step_index": step_index}));
 
+            info!(agent_id = %agent_id, step_index, "agent resumed from checkpoint");
             AgentState {
                 agent_id,
                 step_index,
                 state,
             }
         }
-        None => AgentState::new_agent(agent_id),
+        None => {
+            warn!(agent_id = %agent_id, "no checkpoint found, starting fresh");
+            AgentState::new_agent(agent_id)
+        }
     })
 }
 

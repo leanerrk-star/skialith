@@ -2,6 +2,7 @@ use async_nats::jetstream;
 use bytes::Bytes;
 use serde::Serialize;
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct AgentManager {
@@ -55,6 +56,7 @@ impl AgentManager {
             .publish_with_headers(subject, headers, Bytes::from(payload))
             .await?;
         ack_fut.await?;
+        info!(agent_id, "checkpoint published to JetStream");
 
         Ok(())
     }
