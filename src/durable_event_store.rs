@@ -5,12 +5,14 @@ use serde::Serialize;
 use sqlx::{mysql::MySqlPoolOptions, MySql, MySqlPool, QueryBuilder};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio_retry::strategy::ExponentialBackoff;
 
 #[derive(Debug, Clone)]
 pub struct DurableEventStore {
     nats: NatsClient,
     tidb: MySqlPool,
     enqueue_tx: mpsc::Sender<PendingEvent>,
+    dead_letter_tx: Option<mpsc::Sender<Vec<PendingEvent>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +54,7 @@ pub enum DurableEventStoreError {
 }
 
 #[derive(Debug, Clone)]
-struct PendingEvent {
+pub struct PendingEvent {
     agent_id: String,
     event_id: String,
     payload_json: Vec<u8>,
@@ -73,13 +75,36 @@ impl DurableEventStore {
     /// - `agent_events(agent_id VARCHAR(..), event_id VARCHAR(..), payload_json JSON, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
     pub fn new(nats: NatsClient, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
         let (enqueue_tx, enqueue_rx) = mpsc::channel(cfg.channel_capacity);
-        tokio::spawn(run_tidb_batch_writer(tidb.clone(), cfg, enqueue_rx));
+        tokio::spawn(run_tidb_batch_writer(tidb.clone(), cfg, enqueue_rx, None));
 
         Self {
             nats,
             tidb,
             enqueue_tx,
+            dead_letter_tx: None,
         }
+    }
+
+    /// Attach a dead-letter channel that receives batches of events that could not be
+    /// written to TiDB after all retries are exhausted.
+    pub fn with_dead_letter(mut self, tx: mpsc::Sender<Vec<PendingEvent>>) -> Self {
+        self.dead_letter_tx = Some(tx);
+        // Re-spawn the batch writer with the dead-letter sender.
+        // Note: the previously spawned writer (from `new`) will exit once the old
+        // enqueue channel's receiver half is dropped here. We create a fresh channel.
+        let (enqueue_tx, enqueue_rx) = mpsc::channel(
+            // We cannot retrieve the original capacity after the channel is created,
+            // so we use the default capacity for the replacement channel.
+            10_000,
+        );
+        tokio::spawn(run_tidb_batch_writer(
+            self.tidb.clone(),
+            DurableEventStoreConfig::default(),
+            enqueue_rx,
+            self.dead_letter_tx.clone(),
+        ));
+        self.enqueue_tx = enqueue_tx;
+        self
     }
 
     /// Convenience constructor if you want this struct to own connection setup.
@@ -134,10 +159,64 @@ impl DurableEventStore {
     }
 }
 
+/// Retry strategy: exponential backoff starting at 100 ms, factor 2, max 3 retries.
+fn retry_strategy() -> impl Iterator<Item = Duration> {
+    ExponentialBackoff::from_millis(100).factor(2).take(3)
+}
+
+async fn flush_batch_with_retry(
+    tidb: &MySqlPool,
+    batch: &mut Vec<PendingEvent>,
+    dead_letter_tx: &Option<mpsc::Sender<Vec<PendingEvent>>>,
+) {
+    // Manual retry loop: ExponentialBackoff gives us the sleep durations between
+    // attempts. We can't use Retry::spawn because it requires a closure returning
+    // a Future, and futures can't hold &mut references across closure boundaries.
+    let delays: Vec<Duration> = retry_strategy().collect();
+    let total_attempts = delays.len() + 1;
+
+    for (attempt, delay) in delays.iter().enumerate() {
+        match flush_batch(tidb, batch).await {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!(
+                    "[durable_event_store] TiDB batch write attempt {}/{total_attempts} failed: {e}",
+                    attempt + 1
+                );
+                tokio::time::sleep(*delay).await;
+            }
+        }
+    }
+
+    // Final attempt after all delays exhausted.
+    if flush_batch(tidb, batch).await.is_ok() {
+        return;
+    }
+
+    // All attempts failed: route to dead-letter or log the loss.
+    // `flush_batch` only clears the batch on success, so it still contains the events.
+    eprintln!("[durable_event_store] TiDB batch write failed after {total_attempts} attempts; routing to dead-letter");
+    let failed = std::mem::take(batch);
+    match dead_letter_tx {
+        Some(tx) => {
+            if tx.send(failed).await.is_err() {
+                eprintln!("[durable_event_store] dead-letter channel is closed; events lost");
+            }
+        }
+        None => {
+            eprintln!(
+                "[durable_event_store] no dead-letter channel configured; {} events lost",
+                failed.len()
+            );
+        }
+    }
+}
+
 async fn run_tidb_batch_writer(
     tidb: MySqlPool,
     cfg: DurableEventStoreConfig,
     mut rx: mpsc::Receiver<PendingEvent>,
+    dead_letter_tx: Option<mpsc::Sender<Vec<PendingEvent>>>,
 ) {
     let mut batch: Vec<PendingEvent> = Vec::with_capacity(cfg.max_batch_size);
     let mut ticker = tokio::time::interval(cfg.max_batch_linger);
@@ -150,15 +229,13 @@ async fn run_tidb_batch_writer(
                     Some(ev) => {
                         batch.push(ev);
                         if batch.len() >= cfg.max_batch_size {
-                            if let Err(e) = flush_batch(&tidb, &mut batch).await {
-                                eprintln!("[durable_event_store] TiDB batch write failed: {e}");
-                            }
+                            flush_batch_with_retry(&tidb, &mut batch, &dead_letter_tx).await;
                         }
                     }
                     None => {
                         // Channel closed: flush whatever we have and exit.
                         if !batch.is_empty() {
-                            let _ = flush_batch(&tidb, &mut batch).await;
+                            flush_batch_with_retry(&tidb, &mut batch, &dead_letter_tx).await;
                         }
                         break;
                     }
@@ -166,9 +243,7 @@ async fn run_tidb_batch_writer(
             }
             _ = ticker.tick() => {
                 if !batch.is_empty() {
-                    if let Err(e) = flush_batch(&tidb, &mut batch).await {
-                        eprintln!("[durable_event_store] TiDB batch write failed: {e}");
-                    }
+                    flush_batch_with_retry(&tidb, &mut batch, &dead_letter_tx).await;
                 }
             }
         }
@@ -198,4 +273,3 @@ async fn flush_batch(tidb: &MySqlPool, batch: &mut Vec<PendingEvent>) -> Result<
     batch.clear();
     Ok(())
 }
-
