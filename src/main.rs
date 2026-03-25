@@ -17,6 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = DurableEventStore::connect(&nats_url, &tidb_url, DurableEventStoreConfig::default())
         .await?;
 
+    sqlx::migrate!().run(store.tidb_pool()).await?;
+
     store
         .save_event(
             "agent-123",
