@@ -102,7 +102,7 @@ impl DurableEventStore {
         event_id: &str,
         payload: &T,
     ) -> Result<(), DurableEventStoreError> {
-        let subject = format!("agent.{agent_id}.trace");
+        let subject = format!("agent.trace.{agent_id}");
         let envelope = AgentTraceEvent {
             agent_id,
             event_id,
@@ -151,9 +151,7 @@ async fn run_tidb_batch_writer(
                         batch.push(ev);
                         if batch.len() >= cfg.max_batch_size {
                             if let Err(e) = flush_batch(&tidb, &mut batch).await {
-                                // In a production system you would route this to your logging/metrics.
-                                // We intentionally avoid panicking to keep the worker alive.
-                                let _ = e;
+                                eprintln!("[durable_event_store] TiDB batch write failed: {e}");
                             }
                         }
                     }
@@ -169,7 +167,7 @@ async fn run_tidb_batch_writer(
             _ = ticker.tick() => {
                 if !batch.is_empty() {
                     if let Err(e) = flush_batch(&tidb, &mut batch).await {
-                        let _ = e;
+                        eprintln!("[durable_event_store] TiDB batch write failed: {e}");
                     }
                 }
             }

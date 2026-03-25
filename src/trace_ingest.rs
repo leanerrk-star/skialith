@@ -39,22 +39,21 @@ pub async fn ingest_agent_trace_stream(
         .await
         .map_err(|e| TraceIngestError::Nats(Box::new(e)))?;
 
-    // Create-or-reuse a durable consumer filtered to `agent.trace.*`.
-    let consumer = match stream.get_consumer(durable_consumer_name).await {
-        Ok(c) => c,
-        Err(_) => {
-            let cfg = jetstream::consumer::pull::Config {
+    // Get-or-create a durable consumer filtered to `agent.trace.*`.
+    // Using get_or_create_consumer is atomic: it avoids a race where a transient
+    // get_consumer error incorrectly triggers creation of a duplicate consumer.
+    let consumer = stream
+        .get_or_create_consumer(
+            durable_consumer_name,
+            jetstream::consumer::pull::Config {
                 durable_name: Some(durable_consumer_name.to_string()),
                 filter_subject: "agent.trace.*".to_string(),
                 ack_policy: jetstream::consumer::AckPolicy::Explicit,
                 ..Default::default()
-            };
-            stream
-                .create_consumer(cfg)
-                .await
-                .map_err(|e| TraceIngestError::Nats(Box::new(e)))?
-        }
-    };
+            },
+        )
+        .await
+        .map_err(|e| TraceIngestError::Nats(Box::new(e)))?;
 
     loop {
         // Pull-based consumption with bounded buffering and natural backpressure.
@@ -77,11 +76,18 @@ pub async fn ingest_agent_trace_stream(
 
             let payload: Value = serde_json::from_slice(&msg.payload)?;
 
-            // Derive step_index and event_type from the payload if present, otherwise fall back.
+            // Derive step_index from the payload if present.
+            // Fallback: use the JetStream stream sequence number, which is guaranteed unique
+            // per stream. This prevents two payload-less messages for the same agent from
+            // colliding on the UNIQUE KEY (agent_id, step_index) and silently dropping data.
+            let js_sequence = msg
+                .info()
+                .map(|i| i.stream_sequence as i64)
+                .unwrap_or(0);
             let step_index = payload
                 .get("step_index")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
+                .unwrap_or(js_sequence) as i32;
 
             let event_type = payload
                 .get("event_type")
