@@ -13,3 +13,4 @@ dotenvy = "0.15" # For managing DB credentials
 thiserror = "2.0"
 futures = "0.3"
 bytes = "1"
+tracing = "0.1"
