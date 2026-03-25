@@ -89,7 +89,7 @@ impl DurableEventStore {
                 .max(Duration::from_millis(limits::MIN_FLUSH_INTERVAL_MS)),
             ..cfg
         };
-        if cfg.max_batch_size < 256 || cfg.max_batch_linger.as_millis() > 10 {
+        if !limits::is_managed() {
             warn!(
                 max_batch_size = cfg.max_batch_size,
                 flush_interval_ms = cfg.max_batch_linger.as_millis(),
@@ -129,16 +129,23 @@ impl DurableEventStore {
         tidb_url: &str,
         cfg: DurableEventStoreConfig,
     ) -> Result<Self, DurableEventStoreError> {
-        eprintln!(
-            "Durable Agent Core {} (Community Edition)\n\
-             License : BUSL 1.1 — self-hosting in your own VPC is free.\n\
-             Limits  : {} events/sec · {} row batches · {}ms min flush interval\n\
-             Managed : hello@durable.dev for unlimited throughput and SLA support",
-            env!("CARGO_PKG_VERSION"),
-            limits::MAX_EVENTS_PER_SECOND,
-            limits::MAX_BATCH_SIZE,
-            limits::MIN_FLUSH_INTERVAL_MS,
-        );
+        if limits::is_managed() {
+            eprintln!(
+                "Durable Agent Core {} (Managed Edition)",
+                env!("CARGO_PKG_VERSION"),
+            );
+        } else {
+            eprintln!(
+                "Durable Agent Core {} (Community Edition)\n\
+                 License : BUSL 1.1 — self-hosting in your own VPC is free.\n\
+                 Limits  : {} events/sec · {} row batches · {}ms min flush interval\n\
+                 Upgrade : hello@durable.dev",
+                env!("CARGO_PKG_VERSION"),
+                limits::MAX_EVENTS_PER_SECOND,
+                limits::MAX_BATCH_SIZE,
+                limits::MIN_FLUSH_INTERVAL_MS,
+            );
+        }
         let nats = async_nats::connect(nats_url).await?;
         let tidb = MySqlPoolOptions::new().connect(tidb_url).await?;
         Ok(Self::new(nats, tidb, cfg))

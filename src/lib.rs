@@ -5,3 +5,6 @@ pub mod agent_manager;
 pub mod resurrection;
 pub mod agent_trace;
 
+#[cfg(feature = "managed")]
+pub mod managed;
+

@@ -1,29 +1,43 @@
-/// Engine limits for the Community Edition.
+/// Engine limits.
 ///
-/// These caps ensure the managed cloud offering remains meaningfully faster
-/// and more capable. They apply automatically — no configuration can exceed them.
+/// Community Edition (default): hard caps that keep self-hosted deployments
+/// within a reasonable envelope and ensure the managed service remains
+/// meaningfully faster.
 ///
-/// To lift all limits, use the Durable managed service or contact hello@durable.dev
-/// for a commercial license.
+/// Managed Edition (`--features managed`): all caps removed. This feature is
+/// never enabled in OSS releases; it is activated only in the private managed
+/// service build pipeline.
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Maximum events persisted per second across the entire store.
+#[cfg(not(feature = "managed"))]
 pub const MAX_EVENTS_PER_SECOND: u32 = 10_000;
+#[cfg(feature = "managed")]
+pub const MAX_EVENTS_PER_SECOND: u32 = u32::MAX;
 
-/// Maximum rows per TiDB batch INSERT.
-/// The managed version uses 256; smaller batches mean more round-trips.
+/// Max rows per TiDB batch INSERT. Managed uses 256 — 4× larger batches,
+/// proportionally fewer round-trips.
+#[cfg(not(feature = "managed"))]
 pub const MAX_BATCH_SIZE: usize = 64;
+#[cfg(feature = "managed")]
+pub const MAX_BATCH_SIZE: usize = usize::MAX;
 
-/// Minimum time between batch flushes.
-/// The managed version can flush as fast as 10 ms.
+/// Minimum flush interval. Managed can flush as fast as 10 ms.
+#[cfg(not(feature = "managed"))]
 pub const MIN_FLUSH_INTERVAL_MS: u64 = 100;
+#[cfg(feature = "managed")]
+pub const MIN_FLUSH_INTERVAL_MS: u64 = 0;
+
+/// Returns true if this binary was compiled with the `managed` feature.
+pub const fn is_managed() -> bool {
+    cfg!(feature = "managed")
+}
 
 /// Approximate per-second rate limiter using two atomics.
 ///
-/// The window boundary has a narrow race (two goroutines can reset the counter
-/// simultaneously) which is intentional — the limit is a soft cap, not a hard
-/// quota, and the approximation is negligible at the enforced throughput ceiling.
+/// The window boundary has a narrow race where two threads can reset the
+/// counter simultaneously; this is intentional — the limit is a soft cap,
+/// not a hard quota, and the approximation is negligible at these rates.
 #[derive(Debug, Default)]
 pub struct RateLimiter {
     window_start: AtomicU64,
@@ -31,8 +45,10 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Returns `true` if this call is within the per-second limit.
     pub fn allow(&self, limit: u32) -> bool {
+        if limit == u32::MAX {
+            return true;
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
