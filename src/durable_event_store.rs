@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use async_nats::Client as NatsClient;
+use async_nats::{jetstream, Client as NatsClient};
 use serde::Serialize;
 use sqlx::{mysql::MySqlPoolOptions, MySql, MySqlPool, QueryBuilder};
 use thiserror::Error;
@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub struct DurableEventStore {
     nats: NatsClient,
+    js: jetstream::Context,
     tidb: MySqlPool,
     enqueue_tx: mpsc::Sender<PendingEvent>,
 }
@@ -44,6 +45,12 @@ pub enum DurableEventStoreError {
     #[error("nats publish failed")]
     NatsPublish(#[from] async_nats::PublishError),
 
+    #[error("jetstream publish failed")]
+    JetStreamPublish(#[from] async_nats::jetstream::context::PublishError),
+
+    #[error("jetstream stream error")]
+    JetStream(async_nats::jetstream::context::CreateStreamError),
+
     #[error("tidb write failed")]
     Sqlx(#[from] sqlx::Error),
 
@@ -75,8 +82,10 @@ impl DurableEventStore {
         let (enqueue_tx, enqueue_rx) = mpsc::channel(cfg.channel_capacity);
         tokio::spawn(run_tidb_batch_writer(tidb.clone(), cfg, enqueue_rx));
 
+        let js = jetstream::new(nats.clone());
         Self {
             nats,
+            js,
             tidb,
             enqueue_tx,
         }
@@ -110,8 +119,9 @@ impl DurableEventStore {
         };
         let payload_json = serde_json::to_vec(&envelope)?;
 
-        self.nats
+        self.js
             .publish(subject, payload_json.clone().into())
+            .await?
             .await?;
 
         let pending = PendingEvent {
@@ -132,6 +142,25 @@ impl DurableEventStore {
     pub fn tidb_pool(&self) -> &MySqlPool {
         &self.tidb
     }
+}
+
+/// Ensure that the named JetStream stream exists, creating it if necessary.
+///
+/// Uses `get_or_create_stream` so this is safe to call on startup even if the
+/// stream was already provisioned.
+pub async fn ensure_stream(
+    js: &jetstream::Context,
+    stream_name: &str,
+    subjects: Vec<String>,
+) -> Result<(), DurableEventStoreError> {
+    js.get_or_create_stream(jetstream::stream::Config {
+        name: stream_name.to_string(),
+        subjects,
+        ..Default::default()
+    })
+    .await
+    .map_err(DurableEventStoreError::JetStream)?;
+    Ok(())
 }
 
 async fn run_tidb_batch_writer(
