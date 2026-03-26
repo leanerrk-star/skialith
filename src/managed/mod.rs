@@ -16,3 +16,6 @@ pub mod replication;
 
 #[cfg(feature = "managed")]
 pub mod metrics;
+
+#[cfg(feature = "managed")]
+pub mod retention;

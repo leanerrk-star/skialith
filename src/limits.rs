@@ -10,19 +10,14 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Community Edition throughput ceiling.
+/// Community Edition throughput ceiling — always 1,000, regardless of build flags.
 ///
-/// Set to match the natural single-connection PostgreSQL throughput of
-/// DB-first alternatives (LangGraph, DBOS) — so Community is never slower
-/// than competitors, but production workloads (50+ concurrent agents) feel
-/// the backpressure and have a clear reason to upgrade.
+/// Raising this limit requires a valid enterprise license key (`DURABLE_LICENSE_KEY`).
+/// The `--features managed` flag alone is not sufficient; see `crate::license`.
 ///
 /// Conversion trigger: 50 concurrent agents × ~3 events/step each = ~1k/sec.
 /// At that scale the team has real revenue and the managed tier makes sense.
-#[cfg(not(feature = "managed"))]
-pub const MAX_EVENTS_PER_SECOND: u32 = 1_000;
-#[cfg(feature = "managed")]
-pub const MAX_EVENTS_PER_SECOND: u32 = u32::MAX;
+pub const COMMUNITY_RATE_LIMIT: u32 = 1_000;
 
 /// Max rows per TiDB batch INSERT. Managed uses 256 — 4× larger batches,
 /// proportionally fewer round-trips.

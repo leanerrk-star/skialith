@@ -297,7 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !limits::is_managed() {
         println!(
             "  Caps : {}/sec  batch={}  linger={}ms",
-            limits::MAX_EVENTS_PER_SECOND,
+            limits::COMMUNITY_RATE_LIMIT,
             limits::MAX_BATCH_SIZE,
             limits::MIN_FLUSH_INTERVAL_MS,
         );
@@ -335,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Scenario 2: managed config (batch=256, 10ms) vs community (batch=64, 100ms).");
     if !limits::is_managed() {
         println!("  Scenario 3: Community capped at {}/sec. Run --features managed to remove cap.",
-            limits::MAX_EVENTS_PER_SECOND);
+            limits::COMMUNITY_RATE_LIMIT);
     }
     println!("\n  To compare editions:");
     println!("    cargo run --bin benchmark");

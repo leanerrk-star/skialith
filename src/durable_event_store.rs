@@ -9,9 +9,11 @@ use tokio::sync::mpsc;
 use tokio_retry::strategy::ExponentialBackoff;
 use tracing::{debug, info, warn};
 
-use crate::limits::{self, RateLimiter};
+use crate::instance_lock::InstanceLock;
+use crate::limits::RateLimiter;
+use crate::{license, limits};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DurableEventStore {
     nats: NatsClient,
     js: jetstream::Context,
@@ -19,6 +21,10 @@ pub struct DurableEventStore {
     enqueue_tx: mpsc::Sender<PendingEvent>,
     dead_letter_tx: Option<mpsc::Sender<Vec<PendingEvent>>>,
     rate_limiter: Arc<RateLimiter>,
+    /// Effective events/sec ceiling, set from the license at construction time.
+    rate_limit: u32,
+    /// Keeps the NATS KV instance lock alive for the process lifetime.
+    _instance_lock: Option<InstanceLock>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +66,9 @@ pub enum DurableEventStoreError {
 
     #[error("event queue is closed")]
     QueueClosed,
+
+    #[error("instance lock: {0}")]
+    InstanceLock(String),
 }
 
 #[derive(Debug, Clone)]
@@ -77,8 +86,13 @@ pub struct AgentTraceEvent<'a, T: Serialize> {
 }
 
 impl DurableEventStore {
-    pub fn new(nats: NatsClient, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
-        // Apply Community Edition caps. The managed service removes these.
+    pub fn new(
+        nats: NatsClient,
+        tidb: MySqlPool,
+        cfg: DurableEventStoreConfig,
+        rate_limit: u32,
+        instance_lock: Option<InstanceLock>,
+    ) -> Self {
         let cfg = DurableEventStoreConfig {
             max_batch_size: cfg.max_batch_size.min(limits::MAX_BATCH_SIZE),
             max_batch_linger: cfg
@@ -88,9 +102,10 @@ impl DurableEventStore {
         };
         if !limits::is_managed() {
             warn!(
+                rate_limit,
                 max_batch_size = cfg.max_batch_size,
                 flush_interval_ms = cfg.max_batch_linger.as_millis(),
-                "Community Edition limits active — upgrade to managed for full throughput"
+                "Community Edition limits active"
             );
         }
 
@@ -105,6 +120,8 @@ impl DurableEventStore {
             enqueue_tx,
             dead_letter_tx: None,
             rate_limiter: Arc::new(RateLimiter::default()),
+            rate_limit,
+            _instance_lock: instance_lock,
         }
     }
 
@@ -121,31 +138,55 @@ impl DurableEventStore {
         self
     }
 
+    /// Construct directly without connecting to NATS/TiDB. Useful for tests.
+    /// Applies the community rate limit; no instance lock is acquired.
+    pub fn new_unchecked(nats: NatsClient, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
+        Self::new(nats, tidb, cfg, limits::COMMUNITY_RATE_LIMIT, None)
+    }
+
     pub async fn connect(
         nats_url: &str,
         tidb_url: &str,
         cfg: DurableEventStoreConfig,
     ) -> Result<Self, DurableEventStoreError> {
-        if limits::is_managed() {
-            eprintln!(
-                "Durable Agent Core {} (Managed Edition)",
+        let enterprise_license = license::load();
+        let rate_limit = license::effective_rate_limit(&enterprise_license);
+        let ha_allowed = license::allows_ha(&enterprise_license);
+
+        match &enterprise_license {
+            Some(lic) => eprintln!(
+                "Durable Agent Core {} — licensed to {} (rate limit: {}/sec, HA: {})",
                 env!("CARGO_PKG_VERSION"),
-            );
-        } else {
-            eprintln!(
+                lic.customer_id,
+                if rate_limit == u32::MAX { "unlimited".to_string() } else { rate_limit.to_string() },
+                if ha_allowed { "enabled" } else { "disabled" },
+            ),
+            None if limits::is_managed() => eprintln!(
+                "Durable Agent Core {} (Managed Edition — no license key, community limits apply)\n\
+                 Set DURABLE_LICENSE_KEY to unlock full throughput.",
+                env!("CARGO_PKG_VERSION"),
+            ),
+            None => eprintln!(
                 "Durable Agent Core {} (Community Edition)\n\
                  License : BUSL 1.1 — self-hosting in your own VPC is free.\n\
-                 Limits  : {} events/sec · {} row batches · {}ms min flush interval\n\
+                 Limits  : {}/sec · {} row batches · {}ms min flush\n\
                  Upgrade : hello@durable.dev",
                 env!("CARGO_PKG_VERSION"),
-                limits::MAX_EVENTS_PER_SECOND,
+                limits::COMMUNITY_RATE_LIMIT,
                 limits::MAX_BATCH_SIZE,
                 limits::MIN_FLUSH_INTERVAL_MS,
-            );
+            ),
         }
+
         let nats = async_nats::connect(nats_url).await?;
+        let js = jetstream::new(nats.clone());
+
+        let instance_lock = InstanceLock::acquire(&js, ha_allowed)
+            .await
+            .map_err(|e| DurableEventStoreError::InstanceLock(e.to_string()))?;
+
         let tidb = MySqlPoolOptions::new().connect(tidb_url).await?;
-        Ok(Self::new(nats, tidb, cfg))
+        Ok(Self::new(nats, tidb, cfg, rate_limit, Some(instance_lock)))
     }
 
     pub async fn save_event<T: Serialize + Send + Sync>(
@@ -154,9 +195,9 @@ impl DurableEventStore {
         event_id: &str,
         payload: &T,
     ) -> Result<(), DurableEventStoreError> {
-        // Community Edition: block until a slot opens in the current window.
-        // Managed Edition: limit == u32::MAX, returns immediately.
-        self.rate_limiter.wait(limits::MAX_EVENTS_PER_SECOND).await;
+        // Block until a slot is available. Limit is set from the enterprise
+        // license at construction time; defaults to COMMUNITY_RATE_LIMIT (1k/sec).
+        self.rate_limiter.wait(self.rate_limit).await;
 
         let subject = format!("agent.trace.{agent_id}");
         let envelope = AgentTraceEvent {
