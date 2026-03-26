@@ -8,7 +8,7 @@
 /// never enabled in OSS releases; it is activated only in the private managed
 /// service build pipeline.
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(feature = "managed"))]
 pub const MAX_EVENTS_PER_SECOND: u32 = 10_000;
@@ -33,11 +33,20 @@ pub const fn is_managed() -> bool {
     cfg!(feature = "managed")
 }
 
-/// Approximate per-second rate limiter using two atomics.
+/// Per-second rate limiter with backpressure.
 ///
-/// The window boundary has a narrow race where two threads can reset the
-/// counter simultaneously; this is intentional — the limit is a soft cap,
-/// not a hard quota, and the approximation is negligible at these rates.
+/// Unlike a hard-reject limiter, `wait()` blocks the caller until a slot is
+/// available in the current one-second window. Events are never dropped —
+/// callers that exceed the cap are slowed down until the next window opens.
+///
+/// This makes Community Edition lossless but bounded in throughput. The
+/// managed build sets `MAX_EVENTS_PER_SECOND = u32::MAX`, so `wait()` is a
+/// no-op and callers return immediately at full NATS speed.
+///
+/// Implementation: two atomics — the current window epoch (seconds) and the
+/// slot counter. Slot claims use compare-and-exchange to avoid double-counting.
+/// The window boundary has a narrow reset race that is intentional: the limit
+/// is a soft throughput cap, not a cryptographic quota.
 #[derive(Debug, Default)]
 pub struct RateLimiter {
     window_start: AtomicU64,
@@ -45,20 +54,46 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn allow(&self, limit: u32) -> bool {
+    /// Block until a slot is available in the current one-second window.
+    /// Returns immediately if the managed feature is active.
+    pub async fn wait(&self, limit: u32) {
         if limit == u32::MAX {
-            return true;
+            return;
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let prev = self.window_start.load(Ordering::Relaxed);
-        if now != prev {
-            self.window_start.store(now, Ordering::Relaxed);
-            self.count.store(1, Ordering::Relaxed);
-            return true;
+        loop {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let prev = self.window_start.load(Ordering::Relaxed);
+
+            if now_secs != prev {
+                // New window: reset counter and claim this slot.
+                self.window_start.store(now_secs, Ordering::Relaxed);
+                self.count.store(1, Ordering::Relaxed);
+                return;
+            }
+
+            let c = self.count.load(Ordering::Relaxed);
+            if c < limit {
+                // Atomically claim a slot. If another task beat us to it, retry.
+                if self
+                    .count
+                    .compare_exchange(c, c + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return;
+                }
+                continue;
+            }
+
+            // Window is full. Sleep until the start of the next second.
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let sleep_ms = 1001 - (now_ms % 1000);
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
-        self.count.fetch_add(1, Ordering::Relaxed) < limit
     }
 }

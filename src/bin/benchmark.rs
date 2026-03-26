@@ -20,9 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
-use durable_agent_core::durable_event_store::{
-    DurableEventStore, DurableEventStoreConfig, DurableEventStoreError,
-};
+use durable_agent_core::durable_event_store::{DurableEventStore, DurableEventStoreConfig};
 use durable_agent_core::limits;
 use sqlx::mysql::MySqlPoolOptions;
 use tokio::sync::Barrier;
@@ -137,10 +135,6 @@ async fn bench_batch_persistence(
                 .await
             {
                 Ok(()) => {}
-                // Under Community Edition the rate limiter may fire; back off briefly.
-                Err(DurableEventStoreError::RateLimited(_)) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
                 Err(e) => panic!("save_event failed: {e}"),
             }
         }
@@ -183,45 +177,42 @@ async fn bench_batch_persistence(
     }
 }
 
-async fn bench_rate_ceiling(store: &DurableEventStore) {
-    println!("\n━━━ 3. Rate limit ceiling (2 second burst) ━━━");
-    println!("  Fire events as fast as possible. Community cap: 10,000/sec. Managed: unlimited.\n");
+async fn bench_backpressure(store: Arc<DurableEventStore>, concurrency: usize, events_per_task: usize) {
+    let total = concurrency * events_per_task;
+    println!("\n━━━ 3. Backpressure under load ({concurrency} tasks × {events_per_task} events = {total} total) ━━━");
+    println!("  Community: tasks block at 10,000/sec. Zero events lost — just throttled.");
+    println!("  Managed:   no rate limit; bounded only by NATS throughput.\n");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut accepted: u64 = 0;
-    let mut rejected: u64 = 0;
-    let mut i: u64 = 0;
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let start = Instant::now();
 
-    while Instant::now() < deadline {
-        match store
-            .save_event(
-                "bench-rate",
-                &format!("evt-rate-{i}"),
-                &serde_json::json!({}),
-            )
-            .await
-        {
-            Ok(()) => accepted += 1,
-            Err(DurableEventStoreError::RateLimited(_)) => rejected += 1,
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-        i += 1;
-    }
+    let handles: Vec<_> = (0..concurrency)
+        .map(|task_id| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                for i in 0..events_per_task {
+                    store
+                        .save_event(
+                            &format!("bench-backpressure-{task_id}"),
+                            &format!("evt-{i}"),
+                            &serde_json::json!({ "task": task_id, "step": i }),
+                        )
+                        .await
+                        .expect("save_event failed");
+                }
+            })
+        })
+        .collect();
 
-    println!(
-        "  Edition    : {}",
-        if limits::is_managed() { "Managed" } else { "Community" }
-    );
-    println!(
-        "  Ceiling    : {}",
-        if limits::is_managed() {
-            "unlimited".to_string()
-        } else {
-            format!("{}/sec", limits::MAX_EVENTS_PER_SECOND)
-        }
-    );
-    println!("  Accepted   : {accepted}  (~{}/sec)", accepted / 2);
-    println!("  Rejected   : {rejected}  (RateLimited errors)");
+    futures::future::join_all(handles).await;
+    let elapsed = start.elapsed();
+
+    println!("  Edition    : {}", if limits::is_managed() { "Managed" } else { "Community" });
+    println!("  Events     : {total} / {total} accepted (zero loss)");
+    println!("  Elapsed    : {:>8.2?}", elapsed);
+    println!("  Throughput : {:>8.0} events/sec", total as f64 / elapsed.as_secs_f64());
 }
 
 async fn bench_concurrent_throughput(
@@ -241,33 +232,26 @@ async fn bench_concurrent_throughput(
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                let mut accepted = 0usize;
                 for i in 0..events_per_task {
-                    match store
+                    store
                         .save_event(
                             &format!("bench-concurrent-{task_id}"),
                             &format!("evt-{i}"),
                             &serde_json::json!({ "task": task_id, "step": i }),
                         )
                         .await
-                    {
-                        Ok(()) => accepted += 1,
-                        Err(DurableEventStoreError::RateLimited(_)) => {}
-                        Err(e) => panic!("save_event failed: {e}"),
-                    }
+                        .expect("save_event failed");
                 }
-                accepted
             })
         })
         .collect();
 
-    let results = futures::future::join_all(handles).await;
-    let accepted: usize = results.into_iter().map(|r| r.unwrap_or(0)).sum();
+    futures::future::join_all(handles).await;
     let elapsed = start.elapsed();
 
     println!("  elapsed    {:>8.2?}", elapsed);
-    println!("  accepted   {accepted}/{total} events");
-    println!("  throughput {:>8.0} events/sec", accepted as f64 / elapsed.as_secs_f64());
+    println!("  accepted   {total}/{total} events (zero loss)");
+    println!("  throughput {:>8.0} events/sec", total as f64 / elapsed.as_secs_f64());
 }
 
 async fn bench_baseline_mysql_insert(pool: &sqlx::MySqlPool, iterations: usize) {
@@ -342,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     bench_save_event_latency(&store, 500).await;
     bench_batch_persistence(&nats_url, &tidb_url, &pool, 1_000).await;
-    bench_rate_ceiling(&store).await;
+    bench_backpressure(store.clone(), 10, 2_000).await;
     bench_concurrent_throughput(store.clone(), 500, 20).await;
     bench_baseline_mysql_insert(&pool, 500).await;
 

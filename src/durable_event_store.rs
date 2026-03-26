@@ -60,9 +60,6 @@ pub enum DurableEventStoreError {
 
     #[error("event queue is closed")]
     QueueClosed,
-
-    #[error("rate limit exceeded ({0} events/sec); upgrade to the managed service for higher throughput")]
-    RateLimited(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -157,9 +154,9 @@ impl DurableEventStore {
         event_id: &str,
         payload: &T,
     ) -> Result<(), DurableEventStoreError> {
-        if !self.rate_limiter.allow(limits::MAX_EVENTS_PER_SECOND) {
-            return Err(DurableEventStoreError::RateLimited(limits::MAX_EVENTS_PER_SECOND));
-        }
+        // Community Edition: block until a slot opens in the current window.
+        // Managed Edition: limit == u32::MAX, returns immediately.
+        self.rate_limiter.wait(limits::MAX_EVENTS_PER_SECOND).await;
 
         let subject = format!("agent.trace.{agent_id}");
         let envelope = AgentTraceEvent {
