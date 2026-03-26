@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_nats::{jetstream, Client as NatsClient};
@@ -6,24 +7,30 @@ use sqlx::{mysql::MySqlPoolOptions, MySql, MySqlPool, QueryBuilder};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_retry::strategy::ExponentialBackoff;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-#[derive(Debug, Clone)]
+use crate::instance_lock::InstanceLock;
+use crate::limits::RateLimiter;
+use crate::{license, limits};
+
+#[derive(Debug)]
 pub struct DurableEventStore {
     nats: NatsClient,
     js: jetstream::Context,
     tidb: MySqlPool,
     enqueue_tx: mpsc::Sender<PendingEvent>,
     dead_letter_tx: Option<mpsc::Sender<Vec<PendingEvent>>>,
+    rate_limiter: Arc<RateLimiter>,
+    /// Effective events/sec ceiling, set from the license at construction time.
+    rate_limit: u32,
+    /// Keeps the NATS KV instance lock alive for the process lifetime.
+    _instance_lock: Option<InstanceLock>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DurableEventStoreConfig {
-    /// Maximum number of events to batch into a single TiDB INSERT.
     pub max_batch_size: usize,
-    /// Maximum time to wait before flushing a non-empty batch.
     pub max_batch_linger: Duration,
-    /// Channel capacity between `save_event` and the TiDB batch writer.
     pub channel_capacity: usize,
 }
 
@@ -59,6 +66,9 @@ pub enum DurableEventStoreError {
 
     #[error("event queue is closed")]
     QueueClosed,
+
+    #[error("instance lock: {0}")]
+    InstanceLock(String),
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +78,6 @@ pub struct PendingEvent {
     payload_json: Vec<u8>,
 }
 
-/// A serializable event wrapper. Your domain event type can be embedded in `payload`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentTraceEvent<'a, T: Serialize> {
     pub agent_id: &'a str,
@@ -77,11 +86,29 @@ pub struct AgentTraceEvent<'a, T: Serialize> {
 }
 
 impl DurableEventStore {
-    /// Create a new event store from an existing NATS connection and TiDB pool.
-    ///
-    /// TiDB table expectation (one possible schema):
-    /// - `agent_events(agent_id VARCHAR(..), event_id VARCHAR(..), payload_json JSON, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
-    pub fn new(nats: NatsClient, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
+    pub fn new(
+        nats: NatsClient,
+        tidb: MySqlPool,
+        cfg: DurableEventStoreConfig,
+        rate_limit: u32,
+        instance_lock: Option<InstanceLock>,
+    ) -> Self {
+        let cfg = DurableEventStoreConfig {
+            max_batch_size: cfg.max_batch_size.min(limits::MAX_BATCH_SIZE),
+            max_batch_linger: cfg
+                .max_batch_linger
+                .max(Duration::from_millis(limits::MIN_FLUSH_INTERVAL_MS)),
+            ..cfg
+        };
+        if !limits::is_managed() {
+            warn!(
+                rate_limit,
+                max_batch_size = cfg.max_batch_size,
+                flush_interval_ms = cfg.max_batch_linger.as_millis(),
+                "Community Edition limits active"
+            );
+        }
+
         let (enqueue_tx, enqueue_rx) = mpsc::channel(cfg.channel_capacity);
         tokio::spawn(run_tidb_batch_writer(tidb.clone(), cfg, enqueue_rx, None));
 
@@ -92,21 +119,15 @@ impl DurableEventStore {
             tidb,
             enqueue_tx,
             dead_letter_tx: None,
+            rate_limiter: Arc::new(RateLimiter::default()),
+            rate_limit,
+            _instance_lock: instance_lock,
         }
     }
 
-    /// Attach a dead-letter channel that receives batches of events that could not be
-    /// written to TiDB after all retries are exhausted.
     pub fn with_dead_letter(mut self, tx: mpsc::Sender<Vec<PendingEvent>>) -> Self {
         self.dead_letter_tx = Some(tx);
-        // Re-spawn the batch writer with the dead-letter sender.
-        // Note: the previously spawned writer (from `new`) will exit once the old
-        // enqueue channel's receiver half is dropped here. We create a fresh channel.
-        let (enqueue_tx, enqueue_rx) = mpsc::channel(
-            // We cannot retrieve the original capacity after the channel is created,
-            // so we use the default capacity for the replacement channel.
-            10_000,
-        );
+        let (enqueue_tx, enqueue_rx) = mpsc::channel(10_000);
         tokio::spawn(run_tidb_batch_writer(
             self.tidb.clone(),
             DurableEventStoreConfig::default(),
@@ -117,26 +138,67 @@ impl DurableEventStore {
         self
     }
 
-    /// Convenience constructor if you want this struct to own connection setup.
+    /// Construct directly without connecting to NATS/TiDB. Useful for tests.
+    /// Applies the community rate limit; no instance lock is acquired.
+    pub fn new_unchecked(nats: NatsClient, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
+        Self::new(nats, tidb, cfg, limits::COMMUNITY_RATE_LIMIT, None)
+    }
+
     pub async fn connect(
         nats_url: &str,
         tidb_url: &str,
         cfg: DurableEventStoreConfig,
     ) -> Result<Self, DurableEventStoreError> {
+        let enterprise_license = license::load();
+        let rate_limit = license::effective_rate_limit(&enterprise_license);
+        let ha_allowed = license::allows_ha(&enterprise_license);
+
+        match &enterprise_license {
+            Some(lic) => eprintln!(
+                "Durable Agent Core {} — licensed to {} (rate limit: {}/sec, HA: {})",
+                env!("CARGO_PKG_VERSION"),
+                lic.customer_id,
+                if rate_limit == u32::MAX { "unlimited".to_string() } else { rate_limit.to_string() },
+                if ha_allowed { "enabled" } else { "disabled" },
+            ),
+            None if limits::is_managed() => eprintln!(
+                "Durable Agent Core {} (Managed Edition — no license key, community limits apply)\n\
+                 Set DURABLE_LICENSE_KEY to unlock full throughput.",
+                env!("CARGO_PKG_VERSION"),
+            ),
+            None => eprintln!(
+                "Durable Agent Core {} (Community Edition)\n\
+                 License : BUSL 1.1 — self-hosting in your own VPC is free.\n\
+                 Limits  : {}/sec · {} row batches · {}ms min flush\n\
+                 Upgrade : hello@durable.dev",
+                env!("CARGO_PKG_VERSION"),
+                limits::COMMUNITY_RATE_LIMIT,
+                limits::MAX_BATCH_SIZE,
+                limits::MIN_FLUSH_INTERVAL_MS,
+            ),
+        }
+
         let nats = async_nats::connect(nats_url).await?;
+        let js = jetstream::new(nats.clone());
+
+        let instance_lock = InstanceLock::acquire(&js, ha_allowed)
+            .await
+            .map_err(|e| DurableEventStoreError::InstanceLock(e.to_string()))?;
+
         let tidb = MySqlPoolOptions::new().connect(tidb_url).await?;
-        Ok(Self::new(nats, tidb, cfg))
+        Ok(Self::new(nats, tidb, cfg, rate_limit, Some(instance_lock)))
     }
 
-    /// Publish the event to NATS (write-ahead log) and enqueue for batched TiDB persistence.
-    ///
-    /// NATS subject format: `agent.{agent_id}.trace`
     pub async fn save_event<T: Serialize + Send + Sync>(
         &self,
         agent_id: &str,
         event_id: &str,
         payload: &T,
     ) -> Result<(), DurableEventStoreError> {
+        // Block until a slot is available. Limit is set from the enterprise
+        // license at construction time; defaults to COMMUNITY_RATE_LIMIT (1k/sec).
+        self.rate_limiter.wait(self.rate_limit).await;
+
         let subject = format!("agent.trace.{agent_id}");
         let envelope = AgentTraceEvent {
             agent_id,
@@ -165,16 +227,11 @@ impl DurableEventStore {
         Ok(())
     }
 
-    /// Exposes the underlying pool for migrations / health checks if needed.
     pub fn tidb_pool(&self) -> &MySqlPool {
         &self.tidb
     }
 }
 
-/// Ensure that the named JetStream stream exists, creating it if necessary.
-///
-/// Uses `get_or_create_stream` so this is safe to call on startup even if the
-/// stream was already provisioned.
 pub async fn ensure_stream(
     js: &jetstream::Context,
     stream_name: &str,
@@ -190,7 +247,6 @@ pub async fn ensure_stream(
     Ok(())
 }
 
-/// Retry strategy: exponential backoff starting at 100 ms, factor 2, max 3 retries.
 fn retry_strategy() -> impl Iterator<Item = Duration> {
     ExponentialBackoff::from_millis(100).factor(2).take(3)
 }
@@ -200,9 +256,6 @@ async fn flush_batch_with_retry(
     batch: &mut Vec<PendingEvent>,
     dead_letter_tx: &Option<mpsc::Sender<Vec<PendingEvent>>>,
 ) {
-    // Manual retry loop: ExponentialBackoff gives us the sleep durations between
-    // attempts. We can't use Retry::spawn because it requires a closure returning
-    // a Future, and futures can't hold &mut references across closure boundaries.
     let delays: Vec<Duration> = retry_strategy().collect();
     let total_attempts = delays.len() + 1;
 
@@ -265,7 +318,6 @@ async fn run_tidb_batch_writer(
                         }
                     }
                     None => {
-                        // Channel closed: flush whatever we have and exit.
                         if !batch.is_empty() {
                             flush_batch_with_retry(&tidb, &mut batch, &dead_letter_tx).await;
                         }
@@ -286,14 +338,10 @@ async fn flush_batch(tidb: &MySqlPool, batch: &mut Vec<PendingEvent>) -> Result<
     debug!(batch_size = batch.len(), "flushing batch to TiDB");
     let mut tx = tidb.begin().await?;
 
-    // Multi-row insert; TiDB supports this efficiently.
-    // If your `payload_json` column is JSON, TiDB will accept a JSON string.
     let mut qb: QueryBuilder<MySql> =
         QueryBuilder::new("INSERT INTO agent_events (agent_id, event_id, payload_json) ");
 
     qb.push_values(batch.iter(), |mut b, ev| {
-        // `serde_json::to_vec` always produces UTF-8 JSON.
-        // Still, we convert defensively without panicking.
         let payload_str = String::from_utf8_lossy(&ev.payload_json).into_owned();
         b.push_bind(&ev.agent_id)
             .push_bind(&ev.event_id)

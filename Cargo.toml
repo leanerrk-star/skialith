@@ -3,6 +3,11 @@ name = "durable_agent_core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Internal flag — never enabled in OSS releases.
+# The managed service builds with: cargo build --features managed
+managed = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 async-nats = "0.33" # High-perf NATS client
@@ -15,4 +20,6 @@ futures = "0.3"
 bytes = "1"
 tokio-retry = "0.3"
 tracing = "0.1"
+ed25519-dalek = "2"
+base64 = "0.21"
 axum = "0.7"

@@ -1,28 +1,45 @@
-/// Integration benchmark for durable_agent_core.
+/// Integration benchmark — Community Edition vs Managed Edition.
+///
+/// Run both builds to compare:
+///
+///   cargo run --bin benchmark                    # Community Edition (limits active)
+///   cargo run --bin benchmark --features managed # Managed Edition (no limits)
 ///
 /// Scenarios:
-///   1. save_event latency     — p50/p95/p99 for a single agent publishing sequentially.
-///                               This is dominated by the NATS JetStream PubAck round-trip.
-///   2. Concurrent throughput  — N agents publishing in parallel; measures events/sec.
-///   3. Batch size comparison  — same load replayed with batch sizes 64 / 256 / 512;
-///                               measures time-to-persistence in TiDB.
-///   4. Baseline comparison    — direct single-row MySQL INSERT with no NATS, no batching.
-///                               This is what Postgres-based checkpointers (LangGraph, DBOS)
-///                               do per event. Comparing (1) vs (4) proves the NATS-first thesis.
+///   1. save_event latency     — NATS PubAck round-trip (same for both editions)
+///   2. Batch persistence lag  — time-to-TiDB with community config (batch=64, 100ms)
+///                               vs managed config (batch=256, 10ms)
+///   3. Rate limit ceiling     — saturate save_event; count accepted vs rejected
+///   4. Concurrent throughput  — 500 agents in parallel; measures events/sec
+///   5. Baseline MySQL INSERT   — direct single-row INSERT, no NATS (DB-first comparator)
 ///
 /// Prerequisites:
 ///   docker compose up -d
-///   # Wait for MySQL and NATS to be healthy, then:
 ///   cargo run --bin benchmark
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
 use durable_agent_core::durable_event_store::{DurableEventStore, DurableEventStoreConfig};
+use durable_agent_core::limits;
 use sqlx::mysql::MySqlPoolOptions;
 use tokio::sync::Barrier;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+fn community_config() -> DurableEventStoreConfig {
+    DurableEventStoreConfig {
+        max_batch_size: 64,
+        max_batch_linger: Duration::from_millis(100),
+        channel_capacity: 10_000,
+    }
+}
+
+fn managed_config() -> DurableEventStoreConfig {
+    DurableEventStoreConfig {
+        max_batch_size: 256,
+        max_batch_linger: Duration::from_millis(10),
+        channel_capacity: 10_000,
+    }
+}
 
 fn percentile(sorted: &[u128], p: f64) -> u128 {
     if sorted.is_empty() {
@@ -52,45 +69,121 @@ async fn clear_bench_data(pool: &sqlx::MySqlPool) {
         .ok();
 }
 
-// ── scenario 1: save_event latency ───────────────────────────────────────────
-
 async fn bench_save_event_latency(store: &DurableEventStore, iterations: usize) {
-    println!("\n━━━ Scenario 1: save_event latency ({iterations} iterations) ━━━");
-    println!("  What: time for one save_event call to return (= NATS PubAck round-trip).");
-    println!("  The TiDB write happens in the background — this is the caller-visible cost.\n");
+    println!("\n━━━ 1. save_event latency ({iterations} iterations) ━━━");
+    println!("  Caller-visible cost: NATS JetStream PubAck. TiDB write is async.\n");
 
     let mut latencies = Vec::with_capacity(iterations);
-
     for i in 0..iterations {
-        let start = Instant::now();
+        let t = Instant::now();
         store
             .save_event(
-                "bench-agent-single",
+                "bench-latency",
                 &format!("evt-{i}"),
-                &serde_json::json!({ "step": i, "thought": "benchmark payload" }),
+                &serde_json::json!({ "step": i }),
             )
             .await
             .expect("save_event failed");
-        latencies.push(start.elapsed().as_micros());
+        latencies.push(t.elapsed().as_micros());
     }
-
-    print_latencies("save_event (NATS PubAck)", latencies);
+    print_latencies("NATS PubAck", latencies);
 }
 
-// ── scenario 2: concurrent throughput ────────────────────────────────────────
-
-async fn bench_concurrent_throughput(
-    store: Arc<DurableEventStore>,
-    concurrency: usize,
-    events_per_task: usize,
+async fn bench_batch_persistence(
+    nats_url: &str,
+    tidb_url: &str,
+    pool: &sqlx::MySqlPool,
+    event_count: usize,
 ) {
+    println!("\n━━━ 2. Batch persistence lag ({event_count} events) ━━━");
+    println!("  Time from last publish until all rows are visible in TiDB.");
+    println!("  Community: batch=64, linger=100ms   Managed: batch=256, linger=10ms\n");
+
+    struct Profile {
+        name: &'static str,
+        cfg: DurableEventStoreConfig,
+    }
+
+    let profiles = [
+        Profile {
+            name: "Community  (batch= 64, linger=100ms)",
+            cfg: community_config(),
+        },
+        Profile {
+            name: "Managed    (batch=256, linger= 10ms)",
+            cfg: managed_config(),
+        },
+    ];
+
+    for profile in &profiles {
+        let store = DurableEventStore::connect(nats_url, tidb_url, profile.cfg.clone())
+            .await
+            .expect("connect failed");
+
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        for i in 0..event_count {
+            match store
+                .save_event(
+                    "bench-batch",
+                    &format!("evt-{run_id}-{i}"),
+                    &serde_json::json!({ "step": i }),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => panic!("save_event failed: {e}"),
+            }
+        }
+
+        let start = Instant::now();
+        let deadline = Duration::from_secs(15);
+        loop {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM agent_events WHERE agent_id = 'bench-batch'")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or((0,));
+
+            if count >= event_count as i64 {
+                break;
+            }
+            if start.elapsed() > deadline {
+                println!(
+                    "  {}  TIMEOUT ({count}/{event_count} persisted)",
+                    profile.name
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        println!("  {}  {:>8.2?}", profile.name, start.elapsed());
+
+        sqlx::query("DELETE FROM agent_events WHERE agent_id = 'bench-batch'")
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    if !limits::is_managed() {
+        println!(
+            "\n  ↑ Managed config was clamped to Community limits in this build.");
+        println!(
+            "    Run --features managed to observe the uncapped managed profile.");
+    }
+}
+
+async fn bench_backpressure(store: Arc<DurableEventStore>, concurrency: usize, events_per_task: usize) {
     let total = concurrency * events_per_task;
-    println!("\n━━━ Scenario 2: concurrent throughput ━━━");
-    println!("  concurrency={concurrency}, events_per_task={events_per_task}, total={total}\n");
+    println!("\n━━━ 3. Backpressure under load ({concurrency} tasks × {events_per_task} events = {total} total) ━━━");
+    println!("  Community: tasks block at 1,000/sec. Zero events lost — just throttled.");
+    println!("  Managed:   no rate limit; bounded only by NATS throughput.\n");
 
-    // Barrier ensures all tasks start simultaneously for a fair measurement.
     let barrier = Arc::new(Barrier::new(concurrency));
-
     let start = Instant::now();
 
     let handles: Vec<_> = (0..concurrency)
@@ -102,7 +195,7 @@ async fn bench_concurrent_throughput(
                 for i in 0..events_per_task {
                     store
                         .save_event(
-                            &format!("bench-agent-{task_id}"),
+                            &format!("bench-backpressure-{task_id}"),
                             &format!("evt-{i}"),
                             &serde_json::json!({ "task": task_id, "step": i }),
                         )
@@ -115,117 +208,73 @@ async fn bench_concurrent_throughput(
 
     futures::future::join_all(handles).await;
     let elapsed = start.elapsed();
-    let throughput = total as f64 / elapsed.as_secs_f64();
+
+    println!("  Edition    : {}", if limits::is_managed() { "Managed" } else { "Community" });
+    println!("  Events     : {total} / {total} accepted (zero loss)");
+    println!("  Elapsed    : {:>8.2?}", elapsed);
+    println!("  Throughput : {:>8.0} events/sec", total as f64 / elapsed.as_secs_f64());
+}
+
+async fn bench_concurrent_throughput(
+    store: Arc<DurableEventStore>,
+    concurrency: usize,
+    events_per_task: usize,
+) {
+    let total = concurrency * events_per_task;
+    println!("\n━━━ 4. Concurrent throughput ({concurrency} agents × {events_per_task} events = {total} total) ━━━\n");
+
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..concurrency)
+        .map(|task_id| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                for i in 0..events_per_task {
+                    store
+                        .save_event(
+                            &format!("bench-concurrent-{task_id}"),
+                            &format!("evt-{i}"),
+                            &serde_json::json!({ "task": task_id, "step": i }),
+                        )
+                        .await
+                        .expect("save_event failed");
+                }
+            })
+        })
+        .collect();
+
+    futures::future::join_all(handles).await;
+    let elapsed = start.elapsed();
 
     println!("  elapsed    {:>8.2?}", elapsed);
-    println!("  throughput {:>8.0} events/sec", throughput);
+    println!("  accepted   {total}/{total} events (zero loss)");
+    println!("  throughput {:>8.0} events/sec", total as f64 / elapsed.as_secs_f64());
 }
-
-// ── scenario 3: batch size comparison ────────────────────────────────────────
-
-async fn bench_batch_sizes(
-    nats_url: &str,
-    tidb_url: &str,
-    event_count: usize,
-) {
-    println!("\n━━━ Scenario 3: batch size comparison ({event_count} events) ━━━");
-    println!("  What: time until all events are visible in TiDB (persistence lag).");
-    println!("  Smaller batches = lower lag but more DB round-trips.\n");
-
-    for batch_size in [64usize, 256, 512] {
-        let cfg = DurableEventStoreConfig {
-            max_batch_size: batch_size,
-            max_batch_linger: Duration::from_millis(50),
-            channel_capacity: 10_000,
-        };
-        let store = DurableEventStore::connect(nats_url, tidb_url, cfg)
-            .await
-            .expect("connect failed");
-
-        // Publish all events as fast as possible.
-        // Use a uuid-style suffix to avoid collisions across benchmark re-runs.
-        let run_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        for i in 0..event_count {
-            store
-                .save_event(
-                    "bench-agent-batch",
-                    &format!("evt-{run_id}-{i}"),
-                    &serde_json::json!({ "step": i }),
-                )
-                .await
-                .expect("save_event failed");
-        }
-
-        // Poll TiDB until the expected row count is reached (or 10 s timeout).
-        let pool = store.tidb_pool().clone();
-        let start = Instant::now();
-        let deadline = Duration::from_secs(10);
-        loop {
-            let (count,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM agent_events WHERE agent_id = 'bench-agent-batch'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap_or((0,));
-
-            if count >= event_count as i64 {
-                break;
-            }
-            if start.elapsed() > deadline {
-                println!("  batch_size={batch_size:>4}  TIMEOUT (only {count}/{event_count} persisted)");
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        println!(
-            "  batch_size={batch_size:>4}  time-to-persistence {:>8.2?}",
-            start.elapsed()
-        );
-
-        // Clean up between runs so counts don't bleed across batch sizes.
-        sqlx::query("DELETE FROM agent_events WHERE agent_id = 'bench-agent-batch'")
-            .execute(store.tidb_pool())
-            .await
-            .ok();
-    }
-}
-
-// ── scenario 4: baseline — direct MySQL INSERT (no NATS, no batching) ────────
 
 async fn bench_baseline_mysql_insert(pool: &sqlx::MySqlPool, iterations: usize) {
-    println!("\n━━━ Scenario 4: baseline — direct MySQL INSERT ({iterations} iterations) ━━━");
-    println!("  What: single-row synchronous INSERT, no NATS.");
-    println!("  This is the per-event cost of Postgres-based checkpointers");
-    println!("  (LangGraph-Postgres, DBOS) that block the caller on every write.\n");
+    println!("\n━━━ 5. Baseline: direct MySQL INSERT ({iterations} iterations) ━━━");
+    println!("  Single-row synchronous INSERT, no NATS. Represents the per-event cost of");
+    println!("  DB-first checkpointers (LangGraph-Postgres, DBOS, vanilla SQLite).\n");
 
     let mut latencies = Vec::with_capacity(iterations);
-
     for i in 0..iterations {
-        let start = Instant::now();
+        let t = Instant::now();
         sqlx::query(
             "INSERT INTO agent_events (agent_id, event_id, payload_json) VALUES (?, ?, ?)",
         )
-        .bind("bench-agent-baseline")
-        .bind(format!("evt-baseline-{i}"))
+        .bind("bench-baseline")
+        .bind(format!("evt-{i}"))
         .bind(serde_json::json!({ "step": i }).to_string())
         .execute(pool)
         .await
         .expect("INSERT failed");
-        latencies.push(start.elapsed().as_micros());
+        latencies.push(t.elapsed().as_micros());
     }
-
-    print_latencies("direct MySQL INSERT", latencies);
-
-    println!();
-    println!("  ↑ Compare this p50 to Scenario 1 p50.");
-    println!("  The gap is the latency advantage of NATS-first over DB-first.");
+    print_latencies("MySQL INSERT", latencies);
 }
-
-// ── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -236,11 +285,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tidb_url = std::env::var("TIDB_URL")
         .unwrap_or_else(|_| "mysql://root:root@127.0.0.1:3306/durable_agent".into());
 
-    println!("durable_agent_core benchmark");
+    let edition = if limits::is_managed() {
+        "Managed Edition"
+    } else {
+        "Community Edition"
+    };
+
+    println!("durable_agent_core benchmark — {edition}");
     println!("  NATS : {nats_url}");
     println!("  DB   : {tidb_url}");
+    if !limits::is_managed() {
+        println!(
+            "  Caps : {}/sec  batch={}  linger={}ms",
+            limits::COMMUNITY_RATE_LIMIT,
+            limits::MAX_BATCH_SIZE,
+            limits::MIN_FLUSH_INTERVAL_MS,
+        );
+    }
 
-    // Ensure the JetStream stream exists before publishing.
     let nats = async_nats::connect(&nats_url).await?;
     let js = jetstream::new(nats);
     js.get_or_create_stream(jetstream::stream::Config {
@@ -250,13 +312,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // Standalone pool for the baseline scenario.
     let pool = MySqlPoolOptions::new()
         .max_connections(5)
         .connect(&tidb_url)
         .await?;
 
-    // Default store used for scenarios 1 & 2.
     let store = Arc::new(
         DurableEventStore::connect(&nats_url, &tidb_url, DurableEventStoreConfig::default())
             .await?,
@@ -264,17 +324,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     clear_bench_data(&pool).await;
 
-    // ── run scenarios ──────────────────────────────────────────────────────
     bench_save_event_latency(&store, 500).await;
-    bench_concurrent_throughput(store.clone(), 100, 20).await;
+    bench_batch_persistence(&nats_url, &tidb_url, &pool, 1_000).await;
+    bench_backpressure(store.clone(), 10, 2_000).await;
     bench_concurrent_throughput(store.clone(), 500, 20).await;
-    bench_batch_sizes(&nats_url, &tidb_url, 1_000).await;
     bench_baseline_mysql_insert(&pool, 500).await;
 
-    // ── summary ────────────────────────────────────────────────────────────
-    println!("\n━━━ Done ━━━");
-    println!("  Key comparison: Scenario 1 p50 (NATS PubAck) vs Scenario 4 p50 (MySQL INSERT).");
-    println!("  A lower Scenario 1 p50 proves the NATS-first architecture reduces caller latency.");
+    println!("\n━━━ Summary ━━━");
+    println!("  Scenario 1 p50 vs Scenario 5 p50: NATS-first latency advantage over DB-first.");
+    println!("  Scenario 2: managed config (batch=256, 10ms) vs community (batch=64, 100ms).");
+    if !limits::is_managed() {
+        println!("  Scenario 3: Community capped at {}/sec. Run --features managed to remove cap.",
+            limits::COMMUNITY_RATE_LIMIT);
+    }
+    println!("\n  To compare editions:");
+    println!("    cargo run --bin benchmark");
+    println!("    cargo run --bin benchmark --features managed");
 
     clear_bench_data(&pool).await;
     Ok(())
