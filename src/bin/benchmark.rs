@@ -180,7 +180,7 @@ async fn bench_batch_persistence(
 async fn bench_backpressure(store: Arc<DurableEventStore>, concurrency: usize, events_per_task: usize) {
     let total = concurrency * events_per_task;
     println!("\n━━━ 3. Backpressure under load ({concurrency} tasks × {events_per_task} events = {total} total) ━━━");
-    println!("  Community: tasks block at 10,000/sec. Zero events lost — just throttled.");
+    println!("  Community: tasks block at 1,000/sec. Zero events lost — just throttled.");
     println!("  Managed:   no rate limit; bounded only by NATS throughput.\n");
 
     let barrier = Arc::new(Barrier::new(concurrency));
