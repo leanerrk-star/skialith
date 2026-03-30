@@ -1,17 +1,17 @@
-# durable-agent-core Python SDK
+# skialith Python SDK
 
-Python client for the durable-agent-core HTTP sidecar — giving your AI agents crash-safe checkpointing and an audit trail out of the box.
+Python client for the skialith HTTP sidecar — giving your AI agents crash-safe checkpointing and an audit trail out of the box.
 
 ## Installation
 
 ```bash
-pip install durable-agent-core
+pip install skialith
 ```
 
 For LangGraph support:
 
 ```bash
-pip install 'durable-agent-core[langchain]'
+pip install 'skialith[langchain]'
 ```
 
 ## Quick Start
@@ -20,10 +20,10 @@ The core pattern is: **resume** on startup, **checkpoint** before risky operatio
 
 ```python
 import asyncio
-from durable_agent import DurableAgent
+from skialith import SkialithAgent
 
 async def run_agent():
-    async with DurableAgent(agent_id="my-agent-001") as agent:
+    async with SkialithAgent(agent_id="my-agent-001") as agent:
         # 1. Resume from the last checkpoint (returns fresh state on first run)
         state = await agent.resume()
         print(f"Resuming from step {state.step_index}")
@@ -58,13 +58,13 @@ If the process crashes between steps the sidecar retains the last checkpoint. On
 
 ## LangGraph Integration
 
-`DurableCheckpointer` is a drop-in replacement for LangGraph's built-in checkpointers:
+`SkialithCheckpointer` is a drop-in replacement for LangGraph's built-in checkpointers:
 
 ```python
 from langgraph.graph import StateGraph
-from durable_agent.langchain import DurableCheckpointer
+from skialith.langchain import SkialithCheckpointer
 
-checkpointer = DurableCheckpointer(sidecar_url="http://localhost:8080")
+checkpointer = SkialithCheckpointer(sidecar_url="http://localhost:8080")
 
 builder = StateGraph(...)
 # ... add nodes and edges ...
@@ -77,7 +77,7 @@ result = await app.ainvoke(
 )
 ```
 
-Every `aput` call persists the LangGraph checkpoint to durable-agent-core. On restart, `aget` restores the last saved checkpoint so the graph continues from where it left off.
+Every `aput` call persists the LangGraph checkpoint to skialith. On restart, `aget` restores the last saved checkpoint so the graph continues from where it left off.
 
 ## Running the Sidecar
 
@@ -85,7 +85,7 @@ Every `aput` call persists the LangGraph checkpoint to durable-agent-core. On re
 docker run -p 8080:8080 \
   -e NATS_URL=nats://your-nats-host:4222 \
   -e TIDB_URL=mysql://user:pass@your-tidb-host:4000/dbname \
-  durable/agent-core
+  skialith/agent-core
 ```
 
 The sidecar exposes:

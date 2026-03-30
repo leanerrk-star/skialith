@@ -20,21 +20,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
-use durable_agent_core::durable_event_store::{DurableEventStore, DurableEventStoreConfig};
-use durable_agent_core::limits;
+use skialith::durable_event_store::{SkialithStore, SkialithConfig};
+use skialith::limits;
 use sqlx::mysql::MySqlPoolOptions;
 use tokio::sync::Barrier;
 
-fn community_config() -> DurableEventStoreConfig {
-    DurableEventStoreConfig {
+fn community_config() -> SkialithConfig {
+    SkialithConfig {
         max_batch_size: 64,
         max_batch_linger: Duration::from_millis(100),
         channel_capacity: 10_000,
     }
 }
 
-fn managed_config() -> DurableEventStoreConfig {
-    DurableEventStoreConfig {
+fn managed_config() -> SkialithConfig {
+    SkialithConfig {
         max_batch_size: 256,
         max_batch_linger: Duration::from_millis(10),
         channel_capacity: 10_000,
@@ -69,7 +69,7 @@ async fn clear_bench_data(pool: &sqlx::MySqlPool) {
         .ok();
 }
 
-async fn bench_save_event_latency(store: &DurableEventStore, iterations: usize) {
+async fn bench_save_event_latency(store: &SkialithStore, iterations: usize) {
     println!("\n━━━ 1. save_event latency ({iterations} iterations) ━━━");
     println!("  Caller-visible cost: NATS JetStream PubAck. TiDB write is async.\n");
 
@@ -101,7 +101,7 @@ async fn bench_batch_persistence(
 
     struct Profile {
         name: &'static str,
-        cfg: DurableEventStoreConfig,
+        cfg: SkialithConfig,
     }
 
     let profiles = [
@@ -116,7 +116,7 @@ async fn bench_batch_persistence(
     ];
 
     for profile in &profiles {
-        let store = DurableEventStore::connect(nats_url, tidb_url, profile.cfg.clone())
+        let store = SkialithStore::connect(nats_url, tidb_url, profile.cfg.clone())
             .await
             .expect("connect failed");
 
@@ -177,7 +177,7 @@ async fn bench_batch_persistence(
     }
 }
 
-async fn bench_backpressure(store: Arc<DurableEventStore>, concurrency: usize, events_per_task: usize) {
+async fn bench_backpressure(store: Arc<SkialithStore>, concurrency: usize, events_per_task: usize) {
     let total = concurrency * events_per_task;
     println!("\n━━━ 3. Backpressure under load ({concurrency} tasks × {events_per_task} events = {total} total) ━━━");
     println!("  Community: tasks block at 1,000/sec. Zero events lost — just throttled.");
@@ -216,7 +216,7 @@ async fn bench_backpressure(store: Arc<DurableEventStore>, concurrency: usize, e
 }
 
 async fn bench_concurrent_throughput(
-    store: Arc<DurableEventStore>,
+    store: Arc<SkialithStore>,
     concurrency: usize,
     events_per_task: usize,
 ) {
@@ -291,7 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Community Edition"
     };
 
-    println!("durable_agent_core benchmark — {edition}");
+    println!("skialith benchmark — {edition}");
     println!("  NATS : {nats_url}");
     println!("  DB   : {tidb_url}");
     if !limits::is_managed() {
@@ -318,7 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let store = Arc::new(
-        DurableEventStore::connect(&nats_url, &tidb_url, DurableEventStoreConfig::default())
+        SkialithStore::connect(&nats_url, &tidb_url, SkialithConfig::default())
             .await?,
     );
 

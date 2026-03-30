@@ -20,7 +20,7 @@ use std::time::Duration;
 use async_nats::jetstream;
 use thiserror::Error;
 
-const LOCK_BUCKET: &str = "durable-community-instance";
+const LOCK_BUCKET: &str = "skialith-community-instance";
 const LOCK_KEY: &str = "lock";
 const LOCK_TTL: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);

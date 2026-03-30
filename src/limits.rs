@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Community Edition throughput ceiling — always 1,000, regardless of build flags.
 ///
-/// Raising this limit requires a valid enterprise license key (`DURABLE_LICENSE_KEY`).
+/// Raising this limit requires a valid enterprise license key (`SKIALITH_LICENSE_KEY`).
 /// The `--features managed` flag alone is not sufficient; see `crate::license`.
 ///
 /// Conversion trigger: 50 concurrent agents × ~3 events/step each = ~1k/sec.

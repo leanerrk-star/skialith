@@ -373,26 +373,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
-name = "durable_agent_core"
-version = "0.1.0"
-dependencies = [
- "async-nats",
- "axum",
- "base64",
- "bytes",
- "dotenvy",
- "ed25519-dalek",
- "futures",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tokio-retry",
- "tracing",
-]
-
-[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1734,6 +1714,26 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core",
+]
+
+[[package]]
+name = "skialith"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "axum",
+ "base64",
+ "bytes",
+ "dotenvy",
+ "ed25519-dalek",
+ "futures",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-retry",
+ "tracing",
 ]
 
 [[package]]

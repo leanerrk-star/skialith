@@ -1,14 +1,14 @@
-# durable_agent_core
+# skialith
 
 A durability layer for AI agents. Every event your agent produces is written to NATS JetStream as a write-ahead log before it touches the database — giving you sub-millisecond acknowledgement and crash recovery without building any of the plumbing yourself.
 
 ## Why
 
-AI agents fail mid-run. When they do, you lose the work done so far and have to restart from scratch. `durable_agent_core` lets any agent checkpoint its state and replay from the last good step after a crash — whether the crash was in your code, the LLM API, or the host.
+AI agents fail mid-run. When they do, you lose the work done so far and have to restart from scratch. `skialith` lets any agent checkpoint its state and replay from the last good step after a crash — whether the crash was in your code, the LLM API, or the host.
 
 **Compared to checkpointing directly to a database:**
 
-| | Database-first (LangGraph, DBOS) | `durable_agent_core` |
+| | Database-first (LangGraph, DBOS) | `skialith` |
 |---|---|---|
 | Per-event write latency | ~1 ms (synchronous INSERT) | ~133 µs (NATS PubAck) |
 | Under concurrent load | Single connection bottleneck | Parallel, batched to DB |
@@ -21,7 +21,7 @@ AI agents fail mid-run. When they do, you lose the work done so far and have to 
 - **Crash recovery** — `resume_agent` fetches the last checkpointed state on startup. Agents restart from where they left off, not from the beginning.
 - **Idempotent writes** — duplicate events (from retries or redeliveries) are safely ignored at the database layer.
 - **Python and TypeScript SDKs** — thin HTTP clients. No Rust knowledge required.
-- **LangGraph drop-in** — `DurableCheckpointer` implements the LangGraph checkpointer interface so existing graphs need no changes.
+- **LangGraph drop-in** — `SkialithCheckpointer` implements the LangGraph checkpointer interface so existing graphs need no changes.
 - **Self-hosted** — runs inside your own VPC. No data leaves your infrastructure.
 
 ## Quickstart
@@ -37,7 +37,7 @@ This starts NATS (with JetStream) and MySQL on their default ports.
 ### 2. Run the sidecar
 
 ```bash
-TIDB_URL=mysql://root:root@127.0.0.1:3306/durable_agent cargo run --release --bin server
+TIDB_URL=mysql://root:root@127.0.0.1:3306/skialith cargo run --release --bin server
 ```
 
 The sidecar runs on port `8080` by default. Set `SERVER_PORT` to change it.
@@ -47,9 +47,9 @@ The sidecar runs on port `8080` by default. Set `SERVER_PORT` to change it.
 **Python**
 
 ```python
-from durable_agent import DurableAgent
+from skialith import SkialithAgent
 
-async with DurableAgent(agent_id="my-agent") as agent:
+async with SkialithAgent(agent_id="my-agent") as agent:
     # On startup: resume from last checkpoint, or get a fresh state
     state = await agent.resume()
 
@@ -63,9 +63,9 @@ async with DurableAgent(agent_id="my-agent") as agent:
 **TypeScript**
 
 ```typescript
-import { DurableAgent } from "./sdks/typescript/src";
+import { SkialithAgent } from "./sdks/typescript/src";
 
-const agent = new DurableAgent({ agentId: "my-agent" });
+const agent = new SkialithAgent({ agentId: "my-agent" });
 
 const state = await agent.resume();
 await agent.checkpoint(state.stepIndex, { messages });
@@ -75,9 +75,9 @@ await agent.saveEvent("step-1", { kind: "thought", text: "..." });
 ### 4. LangGraph integration
 
 ```python
-from durable_agent.langchain import DurableCheckpointer
+from skialith.langchain import SkialithCheckpointer
 
-checkpointer = DurableCheckpointer()
+checkpointer = SkialithCheckpointer()
 app = graph.compile(checkpointer=checkpointer)
 
 # Run as normal — checkpointing is handled transparently
@@ -126,7 +126,7 @@ Returns `step_index: 0` and `state: { "kind": "NewAgent" }` when no checkpoint e
 | `TIDB_URL` | yes | — | MySQL-compatible connection string |
 | `NATS_URL` | no | `nats://127.0.0.1:4222` | NATS server address |
 | `SERVER_PORT` | no | `8080` | HTTP sidecar port |
-| `DURABLE_LICENSE_KEY` | no | — | Enterprise license key |
+| `SKIALITH_LICENSE_KEY` | no | — | Enterprise license key |
 
 `.env` files are loaded automatically via `dotenvy`.
 

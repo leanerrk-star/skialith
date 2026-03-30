@@ -2,7 +2,7 @@
 ///
 /// The rate limit and HA rights are gated behind a cryptographically signed
 /// license key. The `--features managed` build flag alone is not sufficient —
-/// a valid `DURABLE_LICENSE_KEY` must be present at runtime.
+/// a valid `SKIALITH_LICENSE_KEY` must be present at runtime.
 ///
 /// License key format:
 ///   <base64url(json_payload)>.<base64url(ed25519_signature)>
@@ -20,7 +20,7 @@ use crate::limits::COMMUNITY_RATE_LIMIT;
 
 /// Our embedded Ed25519 public key (32 bytes).
 ///
-/// The corresponding private key lives in Durable's offline signing
+/// The corresponding private key lives in Skialith's offline signing
 /// infrastructure. It is used to sign license payloads for paying customers
 /// and is never stored in source control or shipped binaries.
 ///
@@ -74,11 +74,11 @@ impl License {
     }
 }
 
-/// Load and verify the license from `DURABLE_LICENSE_KEY`.
+/// Load and verify the license from `SKIALITH_LICENSE_KEY`.
 /// Returns `None` if the variable is absent, the format is wrong,
 /// or the Ed25519 signature does not verify.
 pub fn load() -> Option<License> {
-    let raw = std::env::var("DURABLE_LICENSE_KEY").ok()?;
+    let raw = std::env::var("SKIALITH_LICENSE_KEY").ok()?;
     parse_and_verify(raw.trim())
 }
 

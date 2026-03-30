@@ -1,7 +1,7 @@
 {
-  "name": "@durable/agent-core",
+  "name": "@skialith/agent-core",
   "version": "0.1.0",
-  "description": "Durable execution layer for AI agents",
+  "description": "Skialith execution layer for AI agents",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

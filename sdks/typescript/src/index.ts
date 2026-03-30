@@ -4,7 +4,7 @@ export interface AgentState {
   data: Record<string, unknown>;
 }
 
-export class DurableAgent {
+export class SkialithAgent {
   private readonly agentId: string;
   private readonly baseUrl: string;
 

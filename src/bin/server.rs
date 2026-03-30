@@ -1,4 +1,4 @@
-/// HTTP sidecar server for durable_agent_core.
+/// HTTP sidecar server for skialith.
 ///
 /// Exposes three endpoints that Python and TypeScript SDKs call:
 ///
@@ -18,9 +18,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use durable_agent_core::{
+use skialith::{
     agent_manager::AgentManager,
-    durable_event_store::{DurableEventStore, DurableEventStoreConfig},
+    durable_event_store::{SkialithStore, SkialithConfig},
     resurrection::resume_agent,
 };
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<DurableEventStore>,
+    store: Arc<SkialithStore>,
     manager: Arc<AgentManager>,
     tidb: sqlx::MySqlPool,
 }
@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("SERVER_PORT must be a valid port number");
 
     let store = Arc::new(
-        DurableEventStore::connect(&nats_url, &tidb_url, DurableEventStoreConfig::default())
+        SkialithStore::connect(&nats_url, &tidb_url, SkialithConfig::default())
             .await?,
     );
 
@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
-    println!("durable-agent-core server listening on {addr}");
+    println!("skialith server listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

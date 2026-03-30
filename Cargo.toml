@@ -1,5 +1,5 @@
 [package]
-name = "durable_agent_core"
+name = "skialith"
 version = "0.1.0"
 edition = "2024"
 

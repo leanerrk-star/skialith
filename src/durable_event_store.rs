@@ -14,7 +14,7 @@ use crate::limits::RateLimiter;
 use crate::{license, limits};
 
 #[derive(Debug)]
-pub struct DurableEventStore {
+pub struct SkialithStore {
     nats: NatsClient,
     js: jetstream::Context,
     tidb: MySqlPool,
@@ -28,13 +28,13 @@ pub struct DurableEventStore {
 }
 
 #[derive(Debug, Clone)]
-pub struct DurableEventStoreConfig {
+pub struct SkialithConfig {
     pub max_batch_size: usize,
     pub max_batch_linger: Duration,
     pub channel_capacity: usize,
 }
 
-impl Default for DurableEventStoreConfig {
+impl Default for SkialithConfig {
     fn default() -> Self {
         Self {
             max_batch_size: 256,
@@ -45,7 +45,7 @@ impl Default for DurableEventStoreConfig {
 }
 
 #[derive(Debug, Error)]
-pub enum DurableEventStoreError {
+pub enum SkialithError {
     #[error("failed to serialize event payload")]
     Serialize(#[from] serde_json::Error),
 
@@ -85,15 +85,15 @@ pub struct AgentTraceEvent<'a, T: Serialize> {
     pub payload: &'a T,
 }
 
-impl DurableEventStore {
+impl SkialithStore {
     pub fn new(
         nats: NatsClient,
         tidb: MySqlPool,
-        cfg: DurableEventStoreConfig,
+        cfg: SkialithConfig,
         rate_limit: u32,
         instance_lock: Option<InstanceLock>,
     ) -> Self {
-        let cfg = DurableEventStoreConfig {
+        let cfg = SkialithConfig {
             max_batch_size: cfg.max_batch_size.min(limits::MAX_BATCH_SIZE),
             max_batch_linger: cfg
                 .max_batch_linger
@@ -130,7 +130,7 @@ impl DurableEventStore {
         let (enqueue_tx, enqueue_rx) = mpsc::channel(10_000);
         tokio::spawn(run_tidb_batch_writer(
             self.tidb.clone(),
-            DurableEventStoreConfig::default(),
+            SkialithConfig::default(),
             enqueue_rx,
             self.dead_letter_tx.clone(),
         ));
@@ -140,34 +140,34 @@ impl DurableEventStore {
 
     /// Construct directly without connecting to NATS/TiDB. Useful for tests.
     /// Applies the community rate limit; no instance lock is acquired.
-    pub fn new_unchecked(nats: NatsClient, tidb: MySqlPool, cfg: DurableEventStoreConfig) -> Self {
+    pub fn new_unchecked(nats: NatsClient, tidb: MySqlPool, cfg: SkialithConfig) -> Self {
         Self::new(nats, tidb, cfg, limits::COMMUNITY_RATE_LIMIT, None)
     }
 
     pub async fn connect(
         nats_url: &str,
         tidb_url: &str,
-        cfg: DurableEventStoreConfig,
-    ) -> Result<Self, DurableEventStoreError> {
+        cfg: SkialithConfig,
+    ) -> Result<Self, SkialithError> {
         let enterprise_license = license::load();
         let rate_limit = license::effective_rate_limit(&enterprise_license);
         let ha_allowed = license::allows_ha(&enterprise_license);
 
         match &enterprise_license {
             Some(lic) => eprintln!(
-                "Durable Agent Core {} — licensed to {} (rate limit: {}/sec, HA: {})",
+                "Skialith {} — licensed to {} (rate limit: {}/sec, HA: {})",
                 env!("CARGO_PKG_VERSION"),
                 lic.customer_id,
                 if rate_limit == u32::MAX { "unlimited".to_string() } else { rate_limit.to_string() },
                 if ha_allowed { "enabled" } else { "disabled" },
             ),
             None if limits::is_managed() => eprintln!(
-                "Durable Agent Core {} (Managed Edition — no license key, community limits apply)\n\
-                 Set DURABLE_LICENSE_KEY to unlock full throughput.",
+                "Skialith {} (Managed Edition — no license key, community limits apply)\n\
+                 Set SKIALITH_LICENSE_KEY to unlock full throughput.",
                 env!("CARGO_PKG_VERSION"),
             ),
             None => eprintln!(
-                "Durable Agent Core {} (Community Edition)\n\
+                "Skialith {} (Community Edition)\n\
                  License : BUSL 1.1 — self-hosting in your own VPC is free.\n\
                  Limits  : {}/sec · {} row batches · {}ms min flush\n\
                  Upgrade : hello@durable.dev",
@@ -183,7 +183,7 @@ impl DurableEventStore {
 
         let instance_lock = InstanceLock::acquire(&js, ha_allowed)
             .await
-            .map_err(|e| DurableEventStoreError::InstanceLock(e.to_string()))?;
+            .map_err(|e| SkialithError::InstanceLock(e.to_string()))?;
 
         let tidb = MySqlPoolOptions::new().connect(tidb_url).await?;
         Ok(Self::new(nats, tidb, cfg, rate_limit, Some(instance_lock)))
@@ -194,7 +194,7 @@ impl DurableEventStore {
         agent_id: &str,
         event_id: &str,
         payload: &T,
-    ) -> Result<(), DurableEventStoreError> {
+    ) -> Result<(), SkialithError> {
         // Block until a slot is available. Limit is set from the enterprise
         // license at construction time; defaults to COMMUNITY_RATE_LIMIT (1k/sec).
         self.rate_limiter.wait(self.rate_limit).await;
@@ -222,7 +222,7 @@ impl DurableEventStore {
         self.enqueue_tx
             .send(pending)
             .await
-            .map_err(|_| DurableEventStoreError::QueueClosed)?;
+            .map_err(|_| SkialithError::QueueClosed)?;
 
         Ok(())
     }
@@ -236,14 +236,14 @@ pub async fn ensure_stream(
     js: &jetstream::Context,
     stream_name: &str,
     subjects: Vec<String>,
-) -> Result<(), DurableEventStoreError> {
+) -> Result<(), SkialithError> {
     js.get_or_create_stream(jetstream::stream::Config {
         name: stream_name.to_string(),
         subjects,
         ..Default::default()
     })
     .await
-    .map_err(DurableEventStoreError::JetStream)?;
+    .map_err(SkialithError::JetStream)?;
     Ok(())
 }
 
@@ -264,7 +264,7 @@ async fn flush_batch_with_retry(
             Ok(()) => return,
             Err(e) => {
                 eprintln!(
-                    "[durable_event_store] TiDB batch write attempt {}/{total_attempts} failed: {e}",
+                    "[skialith_store] TiDB batch write attempt {}/{total_attempts} failed: {e}",
                     attempt + 1
                 );
                 tokio::time::sleep(*delay).await;
@@ -279,17 +279,17 @@ async fn flush_batch_with_retry(
 
     // All attempts failed: route to dead-letter or log the loss.
     // `flush_batch` only clears the batch on success, so it still contains the events.
-    eprintln!("[durable_event_store] TiDB batch write failed after {total_attempts} attempts; routing to dead-letter");
+    eprintln!("[skialith_store] TiDB batch write failed after {total_attempts} attempts; routing to dead-letter");
     let failed = std::mem::take(batch);
     match dead_letter_tx {
         Some(tx) => {
             if tx.send(failed).await.is_err() {
-                eprintln!("[durable_event_store] dead-letter channel is closed; events lost");
+                eprintln!("[skialith_store] dead-letter channel is closed; events lost");
             }
         }
         None => {
             eprintln!(
-                "[durable_event_store] no dead-letter channel configured; {} events lost",
+                "[skialith_store] no dead-letter channel configured; {} events lost",
                 failed.len()
             );
         }
@@ -298,7 +298,7 @@ async fn flush_batch_with_retry(
 
 async fn run_tidb_batch_writer(
     tidb: MySqlPool,
-    cfg: DurableEventStoreConfig,
+    cfg: SkialithConfig,
     mut rx: mpsc::Receiver<PendingEvent>,
     dead_letter_tx: Option<mpsc::Sender<Vec<PendingEvent>>>,
 ) {
