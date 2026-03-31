@@ -131,7 +131,7 @@ Returns `step_index: 0` and `state: { "kind": "NewAgent" }` when no checkpoint e
 
 ## Rate limiting
 
-The free edition imposes one limit: **1,000 events/sec**. When this ceiling is reached, callers block until capacity is available — no events are dropped or rejected.
+The open-core release has been tested at **1,000 events/sec**.
 
 See [LICENSE](./LICENSE) for the full terms.
 
