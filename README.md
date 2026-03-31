@@ -126,26 +126,19 @@ Returns `step_index: 0` and `state: { "kind": "NewAgent" }` when no checkpoint e
 | `TIDB_URL` | yes | — | MySQL-compatible connection string |
 | `NATS_URL` | no | `nats://127.0.0.1:4222` | NATS server address |
 | `SERVER_PORT` | no | `8080` | HTTP sidecar port |
-| `SKIALITH_LICENSE_KEY` | no | — | Enterprise license key |
 
 `.env` files are loaded automatically via `dotenvy`.
 
-## Community Edition limits
+## Rate limiting
 
-The Community Edition is free for self-hosting and imposes one limit: **1,000 events/sec**. When this ceiling is reached, callers block until capacity is available — no events are dropped or rejected.
-
-This matches the natural throughput ceiling of a single-connection PostgreSQL setup (the common alternative). For most agents this limit is never reached. At roughly 50 concurrent production agents each firing ~3 events per step you will start to see backpressure, at which point the managed service is worth considering.
+The free edition imposes one limit: **1,000 events/sec**. When this ceiling is reached, callers block until capacity is available — no events are dropped or rejected.
 
 See [LICENSE](./LICENSE) for the full terms.
 
 ## Running benchmarks
 
 ```bash
-# Community Edition
 cargo run --bin benchmark
-
-# Managed Edition (requires --features managed and a valid license key)
-cargo run --bin benchmark --features managed
 ```
 
 ## License
@@ -154,4 +147,4 @@ cargo run --bin benchmark --features managed
 
 Free for self-hosting inside your own infrastructure or private VPC. Prohibited: offering this engine as a hosted or managed service to third parties without a commercial license. Converts to Apache 2.0 four years after each version's release date.
 
-Commercial licensing and the managed service: [hello@durable.dev](mailto:hello@durable.dev)
+Contact: [hello@skialith.io](mailto:hello@skialith.io)
