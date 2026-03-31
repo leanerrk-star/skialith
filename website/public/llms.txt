@@ -13,5 +13,5 @@ Skialith is an open-source infrastructure library that makes AI agents crash-rec
 
 ## Links
 - GitHub: https://github.com/leanerrk-star/skialith
-- Website: https://skialith.io
+- Website: https://skialith-protocol.org
 - Protocol spec: https://skialith-protocol.org
